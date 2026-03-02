@@ -2,7 +2,8 @@
 
 A compact, always-on-top color picker for Windows built with [DearPyGui](https://github.com/hoffstadt/DearPyGui). Pick colors from anywhere on screen, explore color harmonies, manage palettes, and export in multiple formats — all from a single window.
 
-Built with multiple AI assistants
+This is my first software project, built entirely with AI assistance 
+(Gemini, ChatGPT, Claude, DeepSeek, google antigravity and VS Code) — without prior coding experience.
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
