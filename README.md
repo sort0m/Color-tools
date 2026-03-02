@@ -45,10 +45,13 @@ This is my first software project, built entirely with AI assistance
 - Config (history, palettes, window position, theme) saved automatically to `%APPDATA%\Color Tools\config.json`
 
 ---
-!(screenshots/ct1.jpg)
-!(screenshots/ct2.jpg)
-!(screenshots/ct3.jpg)
-!(screenshots/ct4.jpg)
+![Harmony tab](screenshots/ct1.png)
+
+![History Tab](screenshots/ct2.png)
+
+![Palettes Tab](screenshots/ct3.png)
+
+![Sliders/contrast](screenshots/ct4.png)
 
 ## Requirements
 
