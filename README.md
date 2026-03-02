@@ -5,6 +5,10 @@ A compact, always-on-top color picker for Windows built with [DearPyGui](https:/
 This is my first software project, built entirely with AI assistance 
 (Gemini, ChatGPT, Claude, DeepSeek, google antigravity and VS Code) — without prior coding experience.
 
+## 📥 Download
+[**Download Color Tools for Windows (.exe)**](https://github.com/sort0m/Color-tools/releases/latest)
+> **Note:** Windows may show a "SmartScreen" warning when running the `.exe` for the first time. This is normal for unsigned indie software. Click **"More info"** and then **"Run anyway"**.
+
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -108,6 +112,20 @@ Color Tools is **Windows only**. It uses Win32 API calls (`ctypes.windll`) for:
 - Window minimize / move
 
 These calls are wrapped in `try/except` so the app won't crash on other platforms, but the UI will not render or behave correctly outside of Windows.
+
+---
+
+## 🛠 How It Was Built
+
+🚀 The Development Journey: From Zero to App
+This project was built without prior coding experience, using a "relay race" of AI models. Each tool played a crucial role in bringing Color Tools to life:
+The Spark (Gemini): I started the journey with Gemini to architect the first basic concepts and structure.
+The Builder (ChatGPT): I turned to ChatGPT to build the core logic and test out the initial features.
+The Refiner (Claude): Claude took the UI to the next level, but as a free user, I quickly hit the message limits.
+The Tinkerer (DeepSeek): When Claude needed a break, DeepSeek stepped in to modify the complex functions and fix logic bugs.
+The Game Changer (Google Antigravity): I eventually discovered Antigravity, which proved to be the most effective of them all. Its agent-based workflow handled multi-file changes and testing more fluently than any standalone chat.
+The Finish Line (VS Code): After reaching the usage limits on Antigravity's free tier, I moved the entire codebase to VS Code for the final polishing, manual tweaks, and packaging.
+This workflow allowed me to bypass the limitations of individual models and leverage the specific strengths of each AI "specialist."
 
 ---
 
