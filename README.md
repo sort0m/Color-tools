@@ -46,11 +46,8 @@ This is my first software project, built entirely with AI assistance
 
 ---
 ![Harmony tab](screenshots/ct1.jpg)
-
 ![History Tab](screenshots/ct2.jpg)
-
 ![Palettes Tab](screenshots/ct3.jpg)
-
 ![Sliders/contrast](screenshots/ct4.jpg)
 
 ## Requirements
