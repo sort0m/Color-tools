@@ -46,7 +46,6 @@ This is my first software project, built entirely with AI assistance
 
 ---
 ![Color Picker](screenshots/ct1.jpg)
-![Harmony Tab](screenshots/ct2.jpg)
 ![Palettes Tab](screenshots/ct3.jpg)
 ![Themes](screenshots/ct4.jpg)
 
