@@ -5,10 +5,6 @@ A compact, always-on-top color picker for Windows built with [DearPyGui](https:/
 This is my first software project, built entirely with AI assistance 
 (Gemini, ChatGPT, Claude, DeepSeek, google antigravity and VS Code) — without prior coding experience.
 
-## 📥 Download
-[**Download Color Tools for Windows (.exe)**](https://github.com/sort0m/Color-tools/releases/latest)
-> **Note:** Windows may show a "SmartScreen" warning when running the `.exe` for the first time. This is normal for unsigned indie software. Click **"More info"** and then **"Run anyway"**.
-
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
