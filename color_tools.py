@@ -2,6 +2,10 @@ import os
 import sys
 import traceback
 import ctypes
+import io
+import zipfile
+import math
+import html as _html
 import faulthandler as _fh
 # Also write to file so crashes are visible without a console
 try:
@@ -30,6 +34,9 @@ import ctypes.wintypes as _wt
 # both monitors and content does not shrink when moving between screens.
 _DPI_SCALE = 1.0
 try:
+    # Level 2 (per-monitor DPI aware): Windows does NOT auto-scale the
+    # window when dragging between monitors with different DPI settings.
+    # The app handles its own scaling via _DPI_SCALE computed at startup.
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
     ctypes.windll.user32.GetDC.restype = ctypes.c_void_p  # HDC is a pointer on 64-bit
     _hdc = ctypes.windll.user32.GetDC(0)
@@ -51,8 +58,6 @@ if getattr(sys, 'frozen', False):
     _SCRIPT_DIR = sys._MEIPASS
 else:
     _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
 
 # ── Win32 native file dialogs ────────────────────────────────────────────────
 # GetOpenFileNameW / GetSaveFileNameW are direct, COM-free Win32 calls.
@@ -153,6 +158,13 @@ except Exception:
         + traceback.format_exc()
     )
 
+def safe_copy(text):
+    """Copy text to clipboard, swallowing any platform errors (e.g. clipboard locked by another app)."""
+    try:
+        pyperclip.copy(text)
+    except Exception as e:
+        _write_log(f"Clipboard copy failed: {e}")
+
 try:
     import dearpygui.dearpygui as dpg
 except Exception:
@@ -166,8 +178,6 @@ try:
 except Exception:
     _PIL_AVAILABLE = False
     _write_log("PIL (Pillow) not found — image palette import disabled.\nInstall with: pip install Pillow")
-
-_write_log("Imports OK, starting up...")
 
 try:
     # -- HWND helper: locates the window by process ID, not title.
@@ -266,7 +276,7 @@ try:
         "Violet": (238, 130, 238),      "YellowGreen": (154, 205, 50),
     }
 
-    @lru_cache(maxsize=32768)
+    @lru_cache(maxsize=512)
     def nearest_css(r, g, b):
         best, bd = "Unknown", float('inf')
         for n, (cr, cg, cb) in CSS_COLORS.items():
@@ -278,7 +288,7 @@ try:
 
     # -- Color conversions ------------------------------------------------
     # Threshold value 0.04045 per the IEC 61966-2-1 standard.
-    # _lin_rgb takes a float [0,1]; _lin normalises an integer [0,255] before calling it.
+    # _lin takes an integer [0,255] and returns a linearised float via LUT.
     _LIN_RGB_LUT = [
         (i/255.)/12.92 if (i/255.) <= 0.04045 else (((i/255.)+0.055)/1.055)**2.4
         for i in range(256)
@@ -371,10 +381,13 @@ try:
         Y = rl * .2126 + gl * .7152 + bl * .0722
         Z = rl * .0193 + gl * .1192 + bl * .9505
         X /= .95047; Z /= 1.08883
+        # FIX: cache _xyz_f_fast(Y) — was called 3× per invocation (redundant).
+        # lab_to_rgb is called ~48× per slider per frame in LAB mode.
+        fY = _xyz_f_fast(Y)
         return (
-            116 * _xyz_f_fast(Y) - 16,
-            500 * (_xyz_f_fast(X) - _xyz_f_fast(Y)),
-            200 * (_xyz_f_fast(Y) - _xyz_f_fast(Z)),
+            116 * fY - 16,
+            500 * (_xyz_f_fast(X) - fY),
+            200 * (fY - _xyz_f_fast(Z)),
         )
 
     # _fi_lab LUT: input t in [0, 1], maps to t**3
@@ -411,7 +424,7 @@ try:
         return int(round(.2126 * r + .7152 * g + .0722 * b))
 
     # -- Formats ----------------------------------------------------------
-    FORMAT_OPTIONS = ["HEX", "RGB", "HSL", "HSV", "CSS Name", "Contrast", "CMYK"]
+    FORMAT_OPTIONS = ["HEX", "RGB", "HSL", "HSV", "CSS Name", "CMYK"]
 
     def format_value(tag, fmt):
         rgb = app.harmony_rgb.get(tag)
@@ -431,11 +444,6 @@ try:
             return f"{h*360:.0f}  {s*100:.0f}%  {v*100:.0f}%"
         if fmt == "CSS Name":
             return nearest_css(r, g, b)
-        if fmt == "Contrast":
-            cw = contrast_ratio(r, g, b, 255, 255, 255)
-            cb = contrast_ratio(r, g, b, 0,   0,   0  )
-            # Plain text used only for the Copy button
-            return f"W {cw:.1f}:1 {wcag_level(cw)}  B {cb:.1f}:1 {wcag_level(cb)}"
         if fmt == "CMYK":
             c, m, y, k = rgb_to_cmyk(r, g, b)
             return f"C{c:.0f}% M{m:.0f}% Y{y:.0f}% K{k:.0f}%"
@@ -443,6 +451,21 @@ try:
 
     HARMONY_TAGS = ["main", "h1", "h2", "h3", "h4", "h5", "h6", "h7"]
     HIST_TAGS    = [f"hist_{i}" for i in range(60)]
+    # (angles, tint_shd) for each mode — used by the combo icon
+    _HARMONY_ICON_DATA = {
+        "Complementary":       ([180],          None),
+        "Split Complementary": ([150, 210],     None),
+        "Analogous":           ([30, -30],      None),
+        "Triadic":             ([120, 240],     None),
+        "Tetradic":            ([90, 180, 270], None),
+        "Rectangle":           ([60, 180, 240], None),
+        "Tints":               ([],             "tint"),
+        "Shades":              ([],             "shade"),
+        "Tones":               ([],             "tone"),
+    }
+    # FIX: _HARMONY_ANGLES was a duplicate of the angle data already in
+    # _HARMONY_ICON_DATA. Derive it to keep a single source of truth.
+    _HARMONY_ANGLES = {k: v[0] for k, v in _HARMONY_ICON_DATA.items() if v[0]}
     HARMONY_KEYS = {tag: {
         "group":       f"group_{tag}",
         "rect":        f"rect_{tag}",
@@ -457,9 +480,7 @@ try:
     } for tag in HARMONY_TAGS}
 
     def refresh_harmony_values():
-        fmt         = app.fmt_mode
-        mode        = app.harmony_mode
-        is_contrast = (fmt == "Contrast")
+        fmt = app.fmt_mode
         for tag in HARMONY_TAGS:
             keys = HARMONY_KEYS[tag]
 
@@ -467,29 +488,69 @@ try:
                 continue
             if not dpg.is_item_shown(keys["group"]):
                 continue
-            dpg.configure_item(keys["val"],      show=not is_contrast)
-            dpg.configure_item(keys["ctr_grp"],  show=is_contrast)
-            dpg.configure_item(keys["ctr_bars"], show=is_contrast)
-            dpg.configure_item(keys["copy_btn"], show=not is_contrast and mode not in ("Tints", "Shades", "Tones"))
-            if is_contrast:
-                rgb = app.harmony_rgb.get(tag)
-                if rgb:
-                    r, g, b = rgb
-                    cw = contrast_ratio(r, g, b, 255, 255, 255)
-                    cb = contrast_ratio(r, g, b, 0,   0,   0  )
-                    dpg.set_value(f"ctr_w_{tag}",
-                                  f"W  {cw:.2f}:1  {wcag_level(cw)}")
-                    dpg.configure_item(f"ctr_w_{tag}", color=wcag_color(cw))
-                    dpg.set_value(f"ctr_b_{tag}",
-                                  f"B  {cb:.2f}:1  {wcag_level(cb)}")
-                    dpg.configure_item(f"ctr_b_{tag}", color=wcag_color(cb))
-                    # Update preview bar text colors
-                    if dpg.does_item_exist(f"ctr_bar_w_txt_{tag}"):
-                        dpg.configure_item(f"ctr_bar_w_txt_{tag}", color=[r, g, b, 255])
-                    if dpg.does_item_exist(f"ctr_bar_b_txt_{tag}"):
-                        dpg.configure_item(f"ctr_bar_b_txt_{tag}", color=[r, g, b, 255])
-            else:
-                dpg.set_value(f"val_{tag}", format_value(tag, fmt))
+            dpg.configure_item(keys["val"],      show=True)
+            dpg.configure_item(keys["ctr_grp"],  show=False)
+            dpg.configure_item(keys["ctr_bars"], show=False)
+            dpg.configure_item(keys["copy_btn"], show=True)
+            dpg.set_value(f"val_{tag}", format_value(tag, fmt))
+
+    # PERF: Reusable theme tags — created once on first call, then only
+    # children are cleared and recreated.  Eliminates 4× unbind + 4× full
+    # delete + 4× rebind per colour change.
+    _WC_THEME_ITEMS = [
+        ("wheel_ctr_w_dynamic_theme",      "wheel_ctr_w"),
+        ("wheel_ctr_b_dynamic_theme",      "wheel_ctr_b"),
+        ("wheel_preview_w_dynamic_theme",  "wheel_preview_w_txt"),
+        ("wheel_preview_b_dynamic_theme",  "wheel_preview_b_txt"),
+    ]
+    _wc_themes_created = [False]
+    _wc_last_sig       = [None]   # FIX: cache last (r,g,b) to skip redundant theme rebuilds
+
+    def _update_wheel_contrast():
+        """Update the WCAG contrast display under the color wheel."""
+        r, g, b = color_sig(app.current_color)
+
+        # FIX: theme children are deleted and recreated on every call even when
+        # the colour has not changed (e.g. palette panel open, wheel idle).
+        # Skip the expensive delete+recreate when nothing has changed.
+        _sig = (r, g, b)
+        if _sig == _wc_last_sig[0] and _wc_themes_created[0]:
+            return
+        _wc_last_sig[0] = _sig
+
+        cw = contrast_ratio(r, g, b, 255, 255, 255)
+        cb = contrast_ratio(r, g, b, 0,   0,   0  )
+        cw_color = tuple(wcag_color(cw)) + (255,)
+        cb_color = tuple(wcag_color(cb)) + (255,)
+
+        dpg.configure_item("wheel_ctr_w",
+            label=f"W  {cw:.2f}:1  {wcag_level(cw)}")
+        dpg.configure_item("wheel_ctr_b",
+            label=f"B  {cb:.2f}:1  {wcag_level(cb)}")
+
+        # Create empty themes once, bind once; afterwards only replace children.
+        if not _wc_themes_created[0]:
+            for th_tag, item_tag in _WC_THEME_ITEMS:
+                with dpg.theme(tag=th_tag): pass
+                dpg.bind_item_theme(item_tag, th_tag)
+            _wc_themes_created[0] = True
+
+        _BLK = (0, 0, 0, 255)
+        _WHT = (255, 255, 255, 255)
+        _rgb = (r, g, b, 255)
+        _specs = [
+            ("wheel_ctr_w_dynamic_theme",      _BLK, cw_color),
+            ("wheel_ctr_b_dynamic_theme",      _BLK, cb_color),
+            ("wheel_preview_w_dynamic_theme",  _WHT, _rgb),
+            ("wheel_preview_b_dynamic_theme",  _BLK, _rgb),
+        ]
+        for th_tag, bg, txt in _specs:
+            dpg.delete_item(th_tag, children_only=True)
+            with dpg.theme_component(dpg.mvButton, parent=th_tag):
+                dpg.add_theme_color(dpg.mvThemeCol_Button,        bg)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, bg)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive,  bg)
+                dpg.add_theme_color(dpg.mvThemeCol_Text,          txt)
 
     # -- Layout constants ─────────────────────────────────────────────────
     def _sc(v):
@@ -497,18 +558,20 @@ try:
 
     W            = _sc(268)
     BW           = _sc(130)
-    VALW         = W - _sc(56)
+    VALW         = W - _sc(56)   # normal width (no scrollbar)
+    VALW_SCROLL  = W - _sc(70)   # narrower when scrollbar visible (Tints/Shades/Tones)
     HSQ          = _sc(26)
     PAL_SW       = _sc(24)
     MAX_PAL_ROWS = 100
 
-    GRAD_W  = W - _sc(30)
+    GRAD_W  = W - _sc(52)
     GRAD_H  = _sc(15)
     THUMB_H = GRAD_H + _sc(4)
     SEGS    = 48
 
     _ESW   = _sc(28)   # palette-editor swatch size
     _ECOLS = 8          # swatches per row in edit mode
+    _BW2   = (W - _sc(8)) // 2 - _sc(8)  # half-width for paired buttons in palette editor
 
     # Pre-computed swatch tags — avoids f-string allocation every frame.
     _PEDIT_SW_TAGS = {i: f"pedit_sw_{i}" for i in range(MAX_PAL_ROWS * _ECOLS + 2)}
@@ -523,10 +586,12 @@ try:
             self.pipette_active       = False
             self.pip_color            = [0, 0, 0, 255]
             self._pipette_thread_tid  = 0
+            self._pipette_hotkey_held = False
             self.current_color   = [0.2, 0.5, 1.0, 1.0]
             self.history         = deque(maxlen=60)
             self.change_time     = 0.
             self.use_wheel       = True
+            self.top_tab         = "wheel"  # "wheel" | "sliders" | "contrast"
             self.harmony_rgb     = {}
             self.palettes        = {}
             self.sl_vals         = {
@@ -539,9 +604,7 @@ try:
             self._last_sig          = None
             self._last_mode         = None
             self._last_fmt          = None
-            self._last_hist         = None
             self._hist_dirty        = True   # set True whenever history changes
-            self._last_pal          = None
             self._last_sl_vals      = {}
             self._pal_order         = []
             self._editing_pal       = None
@@ -555,11 +618,13 @@ try:
             self._pal_drag_active     = False  # threshold exceeded -> real drag
             self._pal_drag_start      = (0, 0) # mouse position at press
             self._pal_drag_insert     = None   # insertion index (0..n), None = no drag
-            self._pending_pal_deselect = False
             # -- Custom titlebar drag state --
             self._tb_dragging         = False
             self._tb_drag_start_vp    = (0, 0)
+            self._tb_hwnd_cache       = None   # Cached HWND for MoveWindow during drag
+            self._tb_lmb_prev         = False  # Win32 LMB state from previous frame
             self._tb_hov              = {"dl_tb_min": None, "dl_tb_close": None}
+            self._vp_size_guard_skip  = 0      # frames to skip viewport size guard
 
             self._pal_selected_idx    = None
             self._pal_pre_edit_snapshot = None # Palette snapshot taken at swatch selection, not yet on stack
@@ -573,7 +638,13 @@ try:
             self._pending_pipette_color  = None # Set by pipette thread, consumed by update()
             self._picker_processing      = False # Guard against recursive picker callbacks
             self._pending_save           = False # Set by background threads, flushed in update()
+            self._pending_close_edit     = False # Set by _close_edit callback; consumed in update() to avoid deleting DPG items inside their own callback
+            self._img_preview_dirty      = False # Set by slider bg thread; triggers preview rebuild
+            self._palette_select_cancel_pending = False  # Set by add_to_history when history shifts during selection
             self._pending_image_import   = None  # PIL Image set by bg thread; consumed by update()
+            self._pending_drop_path      = None  # file path dropped onto window; consumed by update()
+            self._pending_drop_colors    = None  # (colors, fname) parsed by bg thread; shown as preview
+            self._drop_preview_colors_pending = []  # Colours pending commit from drop preview
             self._image_modal_open       = False # True while DPG color-count modal is showing
             self._image_modal_pil        = None  # PIL Image kept alive while modal is open
             self._image_modal_colors     = []    # Current quantized colours shown in modal
@@ -582,7 +653,6 @@ try:
             self._last_viewport_pos      = [100, 100]  # Cached; used by save_config at shutdown
             self._cached_vp_w           = 0     # Cached viewport width
             self._cached_vp_h           = 0     # Cached viewport height
-            self._cached_vp_pos         = [0, 0]  # Cached viewport position
             self._pal_dirty              = True   # Set True whenever palette list changes
             self._harmony_text_dirty     = True   # Throttle: text/WCAG updates deferred during drag
             self._vp_pos_frame_ctr       = 0      # Frame counter for viewport position poll rate
@@ -604,6 +674,17 @@ try:
             if k not in app._pal_order:
                 app._pal_order.append(k)
     _start_pos = _cfg.get('win_pos', [100, 100])
+    # Guard: if the saved position is off all connected monitors (e.g. secondary
+    # monitor was disconnected), reset to a safe default so the window is not
+    # invisible. MonitorFromPoint with MONITOR_DEFAULTTONULL returns NULL when the
+    # point does not intersect any monitor.
+    try:
+        _MONITOR_DEFAULTTONULL = 0
+        _pt_check = _wt.POINT(_start_pos[0], _start_pos[1])
+        if not ctypes.windll.user32.MonitorFromPoint(_pt_check, _MONITOR_DEFAULTTONULL):
+            _start_pos = [100, 100]
+    except Exception:
+        pass
     app.theme_name = _cfg.get('theme_name', 'Dark')
     app.always_on_top = bool(_cfg.get('always_on_top', False))
 
@@ -613,8 +694,6 @@ try:
 
     # round() preserves colour accuracy.
     def to_int(v):
-        if v > 1.5:
-            return max(0, min(255, int(round(v))))
         return max(0, min(255, int(round(v * 255))))
 
     def color_sig(c):
@@ -628,6 +707,12 @@ try:
                 return
             app.history.appendleft(e)
             app._hist_dirty = True
+            # If palette-select mode is active, the appendleft shifts all indices
+            # by one — the UI highlight would point at the wrong swatches.
+            # Signal the main thread to cancel selection cleanly (no DPG calls here
+            # — we are inside a lock and potentially on a background thread).
+            if app.palette_select_mode:
+                app._palette_select_cancel_pending = True
 
     # -- Gradient calculations for sliders --------------------------------
     _grad_ctx_cache = [None, None]  # [last vsig, last result]
@@ -651,29 +736,30 @@ try:
         _grad_ctx_cache[1] = result
         return result
 
+    # PERF: Extracted from _grad_color to avoid creating a new function
+    # object on every call (48 calls per slider per frame).
+    def _clamp_rgb(a, b2, c):
+        return (
+            max(0, min(255, int(round(a * 255)))),
+            max(0, min(255, int(round(b2 * 255)))),
+            max(0, min(255, int(round(c * 255)))),
+        )
+
     def _grad_color(name, t, ctx):
         """Return the RGB tuple for gradient segment t given precomputed ctx."""
         rf, gf, bf, h_, l_, s_, c0, m0, y0, k0, L0, a0, b0_ = ctx
 
-        def f(px):
-            return (
-                max(0, min(255, int(round(px[0] * 255)))),
-                max(0, min(255, int(round(px[1] * 255)))),
-                max(0, min(255, int(round(px[2] * 255)))),
-            )
-
-        if   name == "R":    return f((t, gf, bf))
-        elif name == "G":    return f((rf, t, bf))
-        elif name == "B":    return f((rf, gf, t))
+        if   name == "R":    return _clamp_rgb(t, gf, bf)
+        elif name == "G":    return _clamp_rgb(rf, t, bf)
+        elif name == "B":    return _clamp_rgb(rf, gf, t)
         elif name == "H":
-            hr, hg, hb = colorsys.hls_to_rgb(
+            return _clamp_rgb(*colorsys.hls_to_rgb(
                 t,
                 l_ if .05 < l_ < .95 else .5,
                 s_ if s_ > .05 else 1.,
-            )
-            return f((hr, hg, hb))
-        elif name == "S":    return f(colorsys.hls_to_rgb(h_, l_, t))
-        elif name == "L":    return f(colorsys.hls_to_rgb(h_, t, s_))
+            ))
+        elif name == "S":    return _clamp_rgb(*colorsys.hls_to_rgb(h_, l_, t))
+        elif name == "L":    return _clamp_rgb(*colorsys.hls_to_rgb(h_, t, s_))
         elif name == "C":    return cmyk_to_rgb(t * 100, m0, y0, k0)
         elif name == "M":    return cmyk_to_rgb(c0, t * 100, y0, k0)
         elif name == "Yv":   return cmyk_to_rgb(c0, m0, t * 100, k0)
@@ -706,6 +792,14 @@ try:
     _DL_TAGS = {gname: f"dl_{gname}"
                 for sliders in SLIDERS_BY_MODE.values()
                 for _, gname, *_ in sliders}
+    # Pre-computed (smin, smax) ranges for each slider gname.
+    _SLIDER_RANGE = {gname: (smin, smax)
+                     for sliders in SLIDERS_BY_MODE.values()
+                     for (_, gname, _, smin, smax) in sliders}
+    # Pre-computed mode lookup: which mode owns each gname.
+    _GNAME_MODE = {gname: mode
+                   for mode, sliders in SLIDERS_BY_MODE.items()
+                   for (_, gname, *_) in sliders}
     # Pre-computed segment X positions for gradient slider bars.
     # Computed once at startup — do not change after DPI is set.
     _sw_unit = GRAD_W / SEGS
@@ -731,7 +825,12 @@ try:
             r, g, b = cmyk_to_rgb(sv["C"], sv["M"], sv["Yv"], sv["K"])
         elif mode == "LAB":
             r, g, b = lab_to_rgb(sv["LA"], sv["La"], sv["Lb"])
-            # lab_to_rgb already clamps internally; no extra check needed.
+            # FIX: lab_to_rgb clamps out-of-gamut LAB values to valid RGB. If the
+            # requested LAB point was outside the RGB gamut, sv["LA/La/Lb"] now
+            # disagree with what the colour wheel actually shows. Round-trip back
+            # through rgb_to_lab so the sliders always reflect the true colour.
+            _cL, _ca, _cb = rgb_to_lab(r, g, b)
+            sv["LA"] = int(round(_cL)); sv["La"] = int(round(_ca)); sv["Lb"] = int(round(_cb))
         elif mode == "Grayscale":
             r = g = b = sv["Gray"]
         else:
@@ -782,6 +881,12 @@ try:
 
     def _patch_safe_joystick_apis():
         """Stub out joystick/gamepad APIs to prevent DearPyGui from polling devices."""
+        import platform as _platform
+        # The stub bytes (0x31, 0xC0, 0xC3) are x86/x64 opcodes: xor eax,eax; ret.
+        # Injecting them on ARM64 would cause an Illegal Instruction crash, so skip
+        # the patch entirely on that architecture.
+        if _platform.machine().upper() == 'ARM64':
+            return
         k32 = ctypes.windll.kernel32
         k32.GetProcAddress.restype   = ctypes.c_void_p
         k32.GetProcAddress.argtypes  = [ctypes.c_void_p, ctypes.c_char_p]
@@ -834,7 +939,6 @@ try:
 
 
     _mwfmo_user32 = ctypes.windll.user32
-    _mwfmo_k32    = ctypes.windll.kernel32
 
     _mwfmo_user32.PeekMessageW.restype  = ctypes.c_bool
     _mwfmo_user32.PeekMessageW.argtypes = [
@@ -851,7 +955,7 @@ try:
 
     _PM_REMOVE   = 0x0001
     _QS_ALLINPUT = 0x04FF
-    _MSG_BUF     = (ctypes.c_ubyte * 48)()   # sizeof(MSG) = 48 bytes x64
+    _MSG_BUF     = _wt.MSG()                 # Proper MSG struct (56 bytes on x64)
 
     def _pumping_sleep(seconds):
         """Sleep up to `seconds` while continuously pumping the Win32 message queue."""
@@ -868,9 +972,9 @@ try:
             # ret == 0 (WAIT_OBJECT_0): message arrived — pump it
             if ret == 0:
                 while _mwfmo_user32.PeekMessageW(
-                        _MSG_BUF, None, 0, 0, _PM_REMOVE):
-                    _mwfmo_user32.TranslateMessage(_MSG_BUF)
-                    _mwfmo_user32.DispatchMessageW(_MSG_BUF)
+                        ctypes.byref(_MSG_BUF), None, 0, 0, _PM_REMOVE):
+                    _mwfmo_user32.TranslateMessage(ctypes.byref(_MSG_BUF))
+                    _mwfmo_user32.DispatchMessageW(ctypes.byref(_MSG_BUF))
             # ret == 258 (WAIT_TIMEOUT): time elapsed — done
             else:
                 break
@@ -930,15 +1034,16 @@ try:
             app.change_time   = time.perf_counter()
             _sync_all_modes()
             _update_selected_pal_color()
+            _update_wheel_contrast()
         finally:
             app._picker_processing = False
 
     def copy_preview(s, v):
         r, g, b = color_sig(app.current_color)
-        pyperclip.copy(f"#{r:02x}{g:02x}{b:02x}".upper())
+        safe_copy(f"#{r:02x}{g:02x}{b:02x}".upper())
 
     def copy_harmony_val(s, a, u):
-        pyperclip.copy(dpg.get_value(f"val_{u}"))
+        safe_copy(dpg.get_value(f"val_{u}"))
 
     def hex_input_cb(s, v):
         """Called when the user edits the hex input field and presses Enter."""
@@ -956,6 +1061,7 @@ try:
         col_norm = [r / 255., g / 255., b / 255., 1.]
         _force_update_color_picker(col_norm)
         _sync_all_modes()
+        _update_wheel_contrast()
         add_to_history(col_norm)
 
     def toggle_on_top(s, v):
@@ -978,6 +1084,7 @@ try:
             app._pal_dirty = True
 
     def palette_names():
+        # Reverse _pal_order so the most recently added palette appears first.
         order = [k for k in reversed(app._pal_order) if k in app.palettes]
         # Use a set for O(1) lookup — list search is O(n) per iteration.
         order_set = set(order)
@@ -1000,7 +1107,17 @@ try:
         with _palettes_lock:
             names = palette_names()
             colors_snapshot = {n: list(app.palettes.get(n, [])) for n in names}
-        for pi in range(MAX_PAL_ROWS):
+        _max_pi = min(MAX_PAL_ROWS, len(names) + 1)
+
+        # FIX: _swatch_cb is identical on every iteration and captures no loop
+        # variables — define it once here instead of recreating a new function
+        # object for every swatch in every row.
+        def _swatch_cb(s, a, u):
+            _force_update_color_picker(u)
+            _sync_all_modes()
+            _update_wheel_contrast()
+
+        for pi in range(_max_pi):
             row_tag = f"pal_row_{pi}"
             if not dpg.does_item_exist(row_tag):
                 continue
@@ -1021,10 +1138,6 @@ try:
                     for si in range(row_start, min(row_start + _PCOLS, len(colors))):
                         c    = colors[si]
                         norm = [c[j] / 255. for j in range(3)] + [1.]
-
-                        def _swatch_cb(s, a, u):
-                            _force_update_color_picker(u)
-                            _sync_all_modes()
 
                         dpg.add_color_button(
                             parent=grp, default_value=c,
@@ -1097,6 +1210,7 @@ try:
             c = colors[idx]
             _force_update_color_picker([c[0] / 255., c[1] / 255., c[2] / 255., 1.0])
             _sync_all_modes()
+            _update_wheel_contrast()
         # Restore selection last, after all other state is consistent.
         app._pal_selected_idx = idx if (idx is not None and idx < len(colors)) else None
         save_config()
@@ -1129,15 +1243,17 @@ try:
                 return
             colors = list(app.palettes[name])
 
-        _BW2 = (W - _sc(8)) // 2 - _sc(8)
-
         # ── Callback definitions ─────────────────────────────────────────
         def _close_edit(s, a, u):
             app._editing_pal = None
             app._pal_selected_idx = None
-            app._pending_pal_deselect = False
-            _rebuild_pal_rows()
-            _refresh_pal_edit_panel()
+            # FIX: calling _rebuild_pal_rows() + _refresh_pal_edit_panel() here
+            # tears down "pal_edit_panel" (and the Close button itself) while DPG
+            # is still inside this button's callback — a known cause of C++-level
+            # segfaults in DPG.  Mirror the same deferred pattern used for
+            # picker_wheel: set a flag and let update() do the actual teardown
+            # safely between render frames.
+            app._pending_close_edit = True
 
         def _add_current(s, a, u):
             nm = app._editing_pal
@@ -1154,13 +1270,20 @@ try:
             _rebuild_pal_rows()
             _refresh_pal_edit_panel()
 
-        def _exp_pal(s, a, u):
-            export_palette_by_name(app._editing_pal)
-
-        def _exp_pal_ase(s, a, u):
-            export_palette_ase_by_name(app._editing_pal)
-
         def _del_pal(s, a, u):
+            # Swap normal buttons for confirm view
+            if dpg.does_item_exist("pal_normal_btns"):
+                dpg.configure_item("pal_normal_btns", show=False)
+            if dpg.does_item_exist("pal_del_confirm_grp"):
+                dpg.configure_item("pal_del_confirm_grp", show=True)
+            if dpg.does_item_exist("pal_close_btn"):
+                dpg.configure_item("pal_close_btn", show=False)
+
+        def _del_pal_confirmed(s, a, u):
+            if dpg.does_item_exist("pal_del_confirm_grp"):
+                dpg.configure_item("pal_del_confirm_grp", show=False)
+            if dpg.does_item_exist("pal_normal_btns"):
+                dpg.configure_item("pal_normal_btns", show=True)
             nm = app._editing_pal
             with _palettes_lock:
                 if nm and nm in app.palettes:
@@ -1169,16 +1292,20 @@ try:
                         app._pal_order.remove(nm)
             app._editing_pal = None
             app._pal_selected_idx = None
-            app._pending_pal_deselect = False
             app._pal_dirty = True
             save_config()
             _rebuild_pal_rows()
             _refresh_pal_edit_panel()
 
-        # ── Colour swatches (top) ─────────────────────────────────────────
-        dpg.add_text("Drag to reorder", parent="pal_edit_panel", color=[90, 90, 90])
-        dpg.add_spacer(height=2, parent="pal_edit_panel")
+        def _del_pal_cancel(s, a, u):
+            if dpg.does_item_exist("pal_del_confirm_grp"):
+                dpg.configure_item("pal_del_confirm_grp", show=False)
+            if dpg.does_item_exist("pal_normal_btns"):
+                dpg.configure_item("pal_normal_btns", show=True)
+            if dpg.does_item_exist("pal_close_btn"):
+                dpg.configure_item("pal_close_btn", show=True)
 
+        # ── Colour swatches (top) ─────────────────────────────────────────
         dragging = (drag_src is not None and drag_insert is not None
                     and 0 <= drag_src < len(colors) and len(colors) > 1)
 
@@ -1191,73 +1318,127 @@ try:
         else:
             preview = list(colors)
 
-        if preview:
-            for row_start in range(0, len(preview), _ECOLS):
-                grp = dpg.add_group(parent="pal_edit_panel", horizontal=True)
-                dpg.bind_item_theme(grp, _nospc_theme)
-                for slot in range(row_start, min(row_start + _ECOLS, len(preview))):
-                    c  = preview[slot]
-                    dl = dpg.add_drawlist(parent=grp, tag=f"pedit_sw_{slot}",
-                                         width=_ESW, height=_ESW)
-                    if c is None:
-                        dc = colors[drag_src]
-                        dpg.draw_rectangle(parent=dl,
-                                           pmin=(1, 1), pmax=(_ESW - 2, _ESW - 2),
-                                           fill=[dc[0], dc[1], dc[2], 255],
-                                           color=[220, 200, 50, 255], thickness=2)
-                    else:
-                        is_sel = (app._pal_selected_idx == slot and not dragging)
-                        is_light = _THEME_MAP.get(app.theme_name, (None, None, False))[2]
-                        sel_border = [40, 40, 40, 255] if is_light else [255, 255, 255, 255]
-                        border = sel_border if is_sel else [40, 40, 40, 180]
-                        thick = 2 if is_sel else 1
-                        dpg.draw_rectangle(parent=dl,
-                                           pmin=(1, 1), pmax=(_ESW - 2, _ESW - 2),
-                                           fill=[c[0], c[1], c[2], 255],
-                                           color=border, thickness=thick)
-        else:
-            dpg.add_text("(empty palette)", parent="pal_edit_panel", color=[120, 120, 120])
+        with dpg.group(parent="pal_edit_panel", tag="pal_edit_main"):
+            dpg.add_spacer(height=2)
+
+            if preview:
+                for row_start in range(0, len(preview), _ECOLS):
+                    grp = dpg.add_group(horizontal=True)
+                    dpg.bind_item_theme(grp, _nospc_theme)
+                    for slot in range(row_start, min(row_start + _ECOLS, len(preview))):
+                        c  = preview[slot]
+                        dl = dpg.add_drawlist(parent=grp, tag=f"pedit_sw_{slot}",
+                                             width=_ESW, height=_ESW)
+                        if c is None:
+                            dc = colors[drag_src]
+                            dpg.draw_rectangle(parent=dl,
+                                               pmin=(1, 1), pmax=(_ESW - 2, _ESW - 2),
+                                               fill=[dc[0], dc[1], dc[2], 255],
+                                               color=[220, 200, 50, 255], thickness=2)
+                        else:
+                            is_sel = (app._pal_selected_idx == slot and not dragging)
+                            is_light = _THEME_MAP.get(app.theme_name, (None, None, False))[2]
+                            sel_border = [40, 40, 40, 255] if is_light else [255, 255, 255, 255]
+                            border = sel_border if is_sel else [40, 40, 40, 180]
+                            thick = 2 if is_sel else 1
+                            dpg.draw_rectangle(parent=dl,
+                                               pmin=(1, 1), pmax=(_ESW - 2, _ESW - 2),
+                                               fill=[c[0], c[1], c[2], 255],
+                                               color=border, thickness=thick)
+            else:
+                dpg.add_text("(empty palette)", color=[120, 120, 120])
+
+            dpg.add_spacer(height=2)
+
+            # ── Action buttons (bottom) ───────────────────────────────────────
+            dpg.add_separator()
+            dpg.add_spacer(height=2)
+
+            # Normal buttons group
+            with dpg.group(tag="pal_normal_btns"):
+                _grp2 = dpg.add_group(horizontal=True, tag="pal_action_btns")
+                dpg.add_button(parent=_grp2, label="+ Add color", width=_BW2, height=THUMB_H, callback=_add_current)
+                dpg.add_button(parent=_grp2, tag="pal_undo_btn", label="Undo", width=_BW2, height=THUMB_H,
+                               callback=_pal_undo, enabled=(len(app._pal_undo_stack) > 0))
+
+                dpg.add_spacer(height=2)
+
+                _grp1 = dpg.add_group(horizontal=True, tag="pal_export_btns")
+                dpg.add_button(parent=_grp1, label="Export", width=_BW2, height=THUMB_H, callback=_show_export_format)
+                dpg.add_button(parent=_grp1, label="Delete palette", width=_BW2, height=THUMB_H, callback=_del_pal, tag="pal_delete_btn")
+
+            # Confirmation group — replaces buttons when Delete is clicked
+            with dpg.group(tag="pal_del_confirm_grp", show=False):
+                dpg.add_spacer(height=_sc(6))
+                dpg.add_text("Delete this palette?", color=[220, 80, 80])
+                dpg.add_spacer(height=_sc(6))
+                _grp_del = dpg.add_group(horizontal=True)
+                dpg.add_button(parent=_grp_del, label="Delete", width=_BW2, height=THUMB_H, callback=_del_pal_confirmed)
+                dpg.add_button(parent=_grp_del, label="Cancel", width=_BW2, height=THUMB_H, callback=_del_pal_cancel)
+
+            dpg.add_spacer(height=2)
+            dpg.add_button(
+                label="Close", width=W, height=THUMB_H,
+                callback=_close_edit, tag="pal_close_btn",
+            )
+
+        # Export format selection panel (hidden by default, shown when Export is clicked)
+        with dpg.group(parent="pal_edit_panel", horizontal=False, tag="pal_export_format_panel", show=False):
+            dpg.add_text("Select format:", color=[200, 200, 200])
+            dpg.add_spacer(height=_sc(8))
+            dpg.add_radio_button(
+                items=["HTML (web)", "ASE (Adobe/Affinity)", "ACO (Adobe)", "GPL (GIMP)",
+                       "Procreate (.swatches)"],
+                default_value="HTML (web)",
+                tag="pal_export_format_radio",
+            )
+            dpg.add_spacer(height=_sc(10))
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Export",
+                    width=_BW2,
+                    height=THUMB_H,
+                    callback=lambda s, a, u: _execute_palette_export(
+                        dpg.get_value("pal_export_format_radio").split("(")[0].strip()
+                    ),
+                )
+                dpg.add_button(
+                    label="Cancel",
+                    width=_BW2,
+                    height=THUMB_H,
+                    callback=_hide_export_format,
+                )
 
         dpg.add_spacer(height=2, parent="pal_edit_panel")
-        dpg.add_text("Right-click to remove", parent="pal_edit_panel", color=[90, 90, 90])
+        
+        # Bind delete button theme
+        if dpg.does_item_exist("pal_delete_btn"):
+            dpg.bind_item_theme("pal_delete_btn", _close_btn_theme)
 
-        # ── Action buttons (bottom) ───────────────────────────────────────
-        dpg.add_separator(parent="pal_edit_panel")
-        dpg.add_spacer(height=2, parent="pal_edit_panel")
+    def _update_active_pal_swatch(idx, r, g, b):
+        """Fast-path: update only the fill of one swatch rectangle without rebuilding
+        the entire palette editor panel.
 
-        _grp2 = dpg.add_group(parent="pal_edit_panel", horizontal=True, tag="pal_action_btns")
-        dpg.add_button(parent=_grp2, label="+ Add color", width=_BW2, height=THUMB_H, callback=_add_current)
-        dpg.add_button(parent=_grp2, tag="pal_undo_btn", label="Undo", width=_BW2, height=THUMB_H,
-                       callback=_pal_undo, enabled=(len(app._pal_undo_stack) > 0))
+        The palette editor draws each swatch as a drawlist tagged 'pedit_sw_{slot}'.
+        Each drawlist contains exactly one draw_rectangle as its first draw-layer
+        child (layer 1 in DPG nomenclature, slot index 1 in get_item_children).
+        We configure that rectangle's fill directly — O(1) vs O(n) for a full
+        panel rebuild.
 
-        dpg.add_spacer(height=2, parent="pal_edit_panel")
-
-        _grp1 = dpg.add_group(parent="pal_edit_panel", horizontal=True, tag="pal_export_btns")
-        dpg.add_button(parent=_grp1, label="Export HTML", width=_BW2, height=THUMB_H, callback=_exp_pal)
-        dpg.add_button(parent=_grp1, label="Export ASE",  width=_BW2, height=THUMB_H, callback=_exp_pal_ase)
-
-        dpg.add_spacer(height=2, parent="pal_edit_panel")
-
-        _grp3 = dpg.add_group(parent="pal_edit_panel", horizontal=True, tag="pal_close_btns")
-        dpg.add_button(parent=_grp3, label="Delete palette", width=_BW2, height=THUMB_H, callback=_del_pal)
-        dpg.add_button(parent=_grp3, label="Close editor",   width=_BW2, height=THUMB_H, callback=_close_edit)
-
-        dpg.add_spacer(height=2, parent="pal_edit_panel")
-
-    def export_palette_by_name(name):
-        with _palettes_lock:
-            if not name or name not in app.palettes:
-                return
-            colors = list(app.palettes[name])
-        h = (
-            f"<html><head><meta charset='utf-8'>HTMLTITLE_PLACEHOLDER{_HCSS}</head><body>"
-            f"<h2>HTMLH2_PLACEHOLDER</h2>"
-            f"<table>{_html_table_header()}"
-        )
-        for v in colors:
-            h += _html_color_row(v[0], v[1], v[2])
-        h += "</table></body></html>"
-        _save_html_dialog(h, name)
+        Returns True if the fast update succeeded, False if a full rebuild is needed
+        (e.g. the drawlist or its child no longer exists because the panel was
+        previously torn down).
+        """
+        tag = _PEDIT_SW_TAGS.get(idx)
+        if not tag or not dpg.does_item_exist(tag):
+            return False
+        # DPG stores draw-layer children in slot 2 of get_item_children.
+        children = dpg.get_item_children(tag, 2)
+        if not children:
+            return False
+        rect_id = children[0]  # first item is the colour rectangle
+        dpg.configure_item(rect_id, fill=[r, g, b, 255])
+        return True
 
     def _pal_swatch_right_click(rmb_clicked):
         """Handle right-click colour removal in the palette editor. Called every frame."""
@@ -1268,7 +1449,8 @@ try:
             # the list between the release and the hover loop.
             with _palettes_lock:
                 ncolors = len(app.palettes.get(app._editing_pal, []))
-            for idx in range(ncolors):
+            _max_idx = min(ncolors, len(_PEDIT_SW_TAGS))
+            for idx in range(_max_idx):
                 stag = _PEDIT_SW_TAGS[idx]
                 if dpg.does_item_exist(stag) and dpg.is_item_hovered(stag):
                     _push_pal_undo(app._editing_pal)
@@ -1325,7 +1507,7 @@ try:
 
         def _hovered_slot():
             """Return the index of the slot currently under the mouse pointer."""
-            for slot in range(n + 1):   # up to n slots in the preview
+            for slot in range(min(n + 1, len(_PEDIT_SW_TAGS))):   # up to n slots, clamped to tag dict size
                 t = _PEDIT_SW_TAGS[slot]
                 if dpg.does_item_exist(t) and dpg.is_item_hovered(t):
                     return slot
@@ -1361,10 +1543,9 @@ try:
                     v = [c[0] / 255., c[1] / 255., c[2] / 255., 1.0]
                     _force_update_color_picker(v)
                     _sync_all_modes()
+                    _update_wheel_contrast()
                     _refresh_pal_edit_panel()
                     break
-
-
 
         # ── Mouse moves with LMB held ─────────────────────────────────────────────────────
         if lmb_dn and app._pal_drag_idx is not None:
@@ -1392,6 +1573,16 @@ try:
 
             if app._pal_drag_active:
                 hit = _hovered_slot()
+                # FIX: _hovered_slot() only checks existing drawlist tags (slots
+                # 0..n-1). Slot n is never drawn, so dropping past the last swatch
+                # returned None and left _pal_drag_insert unchanged — making it
+                # impossible to move a colour to the end of the palette.
+                # If the mouse is within the panel but not over any swatch, treat
+                # it as an intent to insert at position n (append to end).
+                if hit is None:
+                    if (dpg.does_item_exist("pal_edit_panel")
+                            and dpg.is_item_hovered("pal_edit_panel")):
+                        hit = n
                 if hit is not None and hit != app._pal_drag_insert:
                     app._pal_drag_insert = hit
                     _refresh_pal_edit_panel(
@@ -1515,6 +1706,7 @@ try:
                 col_norm = [col[0] / 255., col[1] / 255., col[2] / 255., 1.]
                 _force_update_color_picker(col_norm)
                 _sync_all_modes()
+                _update_wheel_contrast()
         # DPG calls made outside the lock to avoid holding it during UI updates.
         if _do_style_update:
             _update_history_selection_style()
@@ -1540,9 +1732,14 @@ try:
     def _commit_image_palette(colors):
         """Commit imported colours to history and palettes. Thread-safe; no DPG calls."""
         with _history_lock:
+            # Build a set for O(1) duplicate checks instead of O(n) deque search.
+            hist_set = {tuple(x) for x in app.history}
             for c in reversed(colors):
-                if c not in app.history:
+                key = tuple(c)
+                if key not in hist_set:
                     app.history.appendleft(c)
+                    hist_set.add(key)
+            app._hist_dirty = True  # FIX: flag was missing — history UI never refreshed after image import
         with _palettes_lock:
             # Name generation, dict write and order registration in one lock.
             name = _auto_pal_name()
@@ -1551,46 +1748,6 @@ try:
         # save_config() is not thread-safe; signal the main thread instead.
         app._pending_save = True
         app._pal_dirty = True
-
-    def import_image_palette():
-        """Open a Win32 file dialog and load the image in a background thread.
-        The colour-count panel is shown by the main thread (update loop)."""
-        if not _PIL_AVAILABLE:
-            app._import_status = ("Pillow not installed. Run: pip install Pillow", time.perf_counter() + 6.0)
-            return
-
-        def _run():
-            try:
-                # Step 1: Win32 file dialog (thread-safe)
-                path = _win32_open_file(
-                    "Open Image",
-                    [
-                        ("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tiff"),
-                        ("All files",   "*.*"),
-                    ],
-                )
-                if not path:
-                    return
-
-                # Step 2: Load and shrink the image
-                try:
-                    pil_img = _PIL_Image.open(path).convert("RGB")
-                    pil_img.thumbnail((200, 200))
-                except Exception:
-                    _write_log("import_image: PIL open failed:\n" + traceback.format_exc())
-                    app._import_status = ("Could not open image — see error.log", time.perf_counter() + 5.0)
-                    return
-
-                # Step 3: Hand the image to the main thread; it will open a DPG modal.
-                # Hand image to the main thread for the colour-count panel.
-                app._pending_image_import = pil_img
-
-            except Exception:
-                _write_log("import_image error:\n" + traceback.format_exc())
-                app._import_status = ("Image import failed — see error.log", time.perf_counter() + 5.0)
-                app._pal_dirty = True
-
-        threading.Thread(target=_run, daemon=True).start()
 
     # -- Image import: quantisation + DPG modal (all on main thread) ----------
 
@@ -1628,9 +1785,23 @@ try:
                     no_alpha=True, no_border=True,
                 )
 
+    # Debounce token: only the most recently requested N is applied.
+    # Rapid slider movement cancels earlier in-flight quantisations.
+    _quant_pending = [0]
+
     def _image_import_slider_cb(s, v):
-        app._image_modal_colors = _quantize_image(app._image_modal_pil, int(v))
-        _rebuild_image_import_preview()
+        n = int(v)
+        _quant_pending[0] = n
+        def _run(requested_n):
+            # Bail out if a newer request arrived while this one was queued.
+            if _quant_pending[0] != requested_n:
+                return
+            colors = _quantize_image(app._image_modal_pil, requested_n)
+            if _quant_pending[0] != requested_n:
+                return  # superseded before we could write
+            app._image_modal_colors = colors
+            app._img_preview_dirty = True  # signal main thread to call _rebuild_image_import_preview
+        threading.Thread(target=_run, args=(n,), daemon=True).start()
 
     def _image_import_ok(s, a, u):
         colors = list(app._image_modal_colors)
@@ -1648,6 +1819,8 @@ try:
         app._image_modal_colors = []
         if dpg.does_item_exist("img_import_win"):
             dpg.configure_item("img_import_win", show=False)
+        if dpg.does_item_exist("pal_import_buttons"):
+            dpg.configure_item("pal_import_buttons", show=True)
         if dpg.does_item_exist("pal_scroll"):
             dpg.configure_item("pal_scroll", show=not bool(app._editing_pal))
         if dpg.does_item_exist("pal_edit_win"):
@@ -1663,6 +1836,8 @@ try:
         app._image_modal_colors = _quantize_image(pil_img, 8)
 
         # Hide the normal palette view; show the import panel instead.
+        if dpg.does_item_exist("pal_import_buttons"):
+            dpg.configure_item("pal_import_buttons", show=False)
         if dpg.does_item_exist("pal_scroll"):
             dpg.configure_item("pal_scroll",   show=False)
         if dpg.does_item_exist("pal_edit_win"):
@@ -1677,69 +1852,264 @@ try:
 
 
 
-    def import_ase_palette():
-        """Import colours from an ASE (Adobe Swatch Exchange) file."""
+    _IMAGE_EXTS = frozenset({
+        ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif",
+    })
+
+    def _import_from_path(path):
+        """Import a palette from a dropped file. Dispatches by extension."""
+        ext = os.path.splitext(path)[1].lower()
         def _run():
             try:
-                # Win32 save dialog — no Tkinter, thread-safe
-                path = _win32_open_file(
-                    "Import ASE Palette",
-                    [("ASE files", "*.ase"), ("All files", "*.*")],
-                )
-                if not path:
-                    return
-                with open(path, 'rb') as f:
-                    data = f.read()
-                # Validate header
-                if data[:4] != b'ASEF':
-                    app._import_status = ("Not a valid ASE file.", time.perf_counter() + 5.0)
-                    return
-                num_blocks = struct.unpack_from('>I', data, 8)[0]
-                pos = 12
-                colors = []
-                for _ in range(num_blocks):
-                    if pos + 6 > len(data):
-                        break
-                    block_type, block_len = struct.unpack_from('>HI', data, pos)
-                    pos += 6
-                    block_end = pos + block_len
-                    if block_type == 0x0001:  # color entry
-                        # name length (uint16) + name (utf-16-be)
-                        if pos + 2 > len(data):
-                            pos = block_end
+                if ext == ".ase":
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                    if data[:4] != b'ASEF':
+                        app._import_status = ("Not a valid ASE file.", time.perf_counter() + 5.0)
+                        return
+                    num_blocks = struct.unpack_from('>I', data, 8)[0]
+                    pos = 12
+                    colors = []
+                    for _ in range(num_blocks):
+                        if pos + 6 > len(data):
+                            break
+                        block_type, block_len = struct.unpack_from('>HI', data, pos)
+                        pos += 6
+                        block_end = pos + block_len
+                        if block_type == 0x0001:
+                            if pos + 2 > len(data):
+                                pos = block_end; continue
+                            name_len = struct.unpack_from('>H', data, pos)[0]
+                            pos += 2 + name_len * 2
+                            if pos + 4 > len(data):
+                                pos = block_end; continue
+                            model = data[pos:pos+4]; pos += 4
+                            if model == b'RGB ':
+                                if pos + 12 > len(data):
+                                    pos = block_end; continue
+                                r, g, b = struct.unpack_from('>fff', data, pos)
+                                r = max(0, min(255, int(round(r * 255))))
+                                g = max(0, min(255, int(round(g * 255))))
+                                b = max(0, min(255, int(round(b * 255))))
+                                colors.append([r, g, b, 255])
+                        pos = block_end
+                    if not colors:
+                        app._import_status = ("No RGB colours found in ASE file.", time.perf_counter() + 5.0)
+                        return
+                    app._pending_drop_colors = (colors, os.path.basename(path))
+
+                elif ext == ".aco":
+                    with open(path, 'rb') as f:
+                        data = f.read()
+                    if len(data) < 4:
+                        app._import_status = ("Not a valid ACO file.", time.perf_counter() + 5.0)
+                        return
+                    aco_version = struct.unpack_from('>H', data, 0)[0]
+                    if aco_version == 2:
+                        # V2-only file: skip version+count header, then each entry
+                        # has 10 bytes of color data + a name string. Try to find
+                        # V1 block appended after V2 (common layout: V1+V2 concat).
+                        # If not present, fall through to parse V2 with name skipping.
+                        pass  # Fall through — V2 color_space==0 entries still work
+                    elif aco_version not in (0, 1):
+                        app._import_status = (f"Unsupported ACO version {aco_version}.", time.perf_counter() + 5.0)
+                        return
+                    color_count = struct.unpack_from('>H', data, 2)[0]
+                    colors = []
+                    pos = 4
+                    for _ in range(color_count):
+                        if pos + 10 > len(data):
+                            break
+                        color_space = struct.unpack_from('>H', data, pos)[0]
+                        pos += 2
+                        if color_space == 0:
+                            r16, g16, b16 = struct.unpack_from('>HHH', data, pos)
+                            colors.append([r16 >> 8, g16 >> 8, b16 >> 8, 255])
+                        pos += 8
+                    if not colors:
+                        app._import_status = ("No RGB colours found in ACO file.", time.perf_counter() + 5.0)
+                        return
+                    app._pending_drop_colors = (colors, os.path.basename(path))
+
+                elif ext == ".gpl":
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                    if not lines or lines[0].strip() != "GIMP Palette":
+                        app._import_status = ("Not a valid GPL file.", time.perf_counter() + 5.0)
+                        return
+                    colors = []
+                    for line in lines[1:]:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
                             continue
-                        name_len = struct.unpack_from('>H', data, pos)[0]
-                        pos += 2 + name_len * 2
-                        # color model (4 chars)
-                        if pos + 4 > len(data):
-                            pos = block_end
-                            continue
-                        model = data[pos:pos+4]
-                        pos += 4
-                        if model == b'RGB ':
-                            if pos + 12 > len(data):
-                                pos = block_end
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            try:
+                                r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+                                if 0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255:
+                                    colors.append([r, g, b, 255])
+                            except (ValueError, IndexError):
                                 continue
-                            r, g, b = struct.unpack_from('>fff', data, pos)
-                            r = max(0, min(255, int(round(r * 255))))
-                            g = max(0, min(255, int(round(g * 255))))
-                            b = max(0, min(255, int(round(b * 255))))
-                            colors.append([r, g, b, 255])
-                    pos = block_end
-                if not colors:
-                    app._import_status = ("No RGB colours found in ASE file.", time.perf_counter() + 5.0)
-                    return
-                _commit_image_palette(colors)
+                    if not colors:
+                        app._import_status = ("No colours found in GPL file.", time.perf_counter() + 5.0)
+                        return
+                    app._pending_drop_colors = (colors, os.path.basename(path))
+
+                elif ext == ".swatches":
+                    with zipfile.ZipFile(path, 'r') as zf:
+                        json_name = next((n for n in zf.namelist() if n.lower().endswith('.json')), None)
+                        if json_name is None:
+                            app._import_status = ("Not a valid .swatches file.", time.perf_counter() + 5.0)
+                            return
+                        data = json.loads(zf.read(json_name).decode('utf-8'))
+                    colors = []
+                    for sw in data.get("swatches", []):
+                        if sw is None:
+                            continue
+                        rf, gf, bf = colorsys.hsv_to_rgb(
+                            float(sw.get("hue", 0)),
+                            float(sw.get("saturation", 0)),
+                            float(sw.get("brightness", 0)),
+                        )
+                        colors.append([int(round(rf*255)), int(round(gf*255)), int(round(bf*255)), 255])
+                    if not colors:
+                        app._import_status = ("No colours found in .swatches file.", time.perf_counter() + 5.0)
+                        return
+                    app._pending_drop_colors = (colors, os.path.basename(path))
+
+                elif ext in _IMAGE_EXTS:
+                    if not _PIL_AVAILABLE:
+                        app._import_status = ("Pillow not installed. Run: pip install Pillow", time.perf_counter() + 6.0)
+                        return
+                    try:
+                        pil_img = _PIL_Image.open(path).convert("RGB")
+                        pil_img.thumbnail((200, 200))
+                    except Exception:
+                        _write_log("drop image open failed:\n" + traceback.format_exc())
+                        app._import_status = ("Could not open image — see error.log", time.perf_counter() + 5.0)
+                        return
+                    app._pending_image_import = pil_img
+
+                else:
+                    app._import_status = (f"Unsupported file type: {ext}", time.perf_counter() + 5.0)
+
             except Exception:
-                _write_log("import_ase error:\n" + traceback.format_exc())
-                app._import_status = ("ASE import failed — see error.log", time.perf_counter() + 5.0)
-                app._pal_dirty = True
+                _write_log("_import_from_path error:\n" + traceback.format_exc())
+                app._import_status = ("Import failed — see error.log", time.perf_counter() + 5.0)
+
         threading.Thread(target=_run, daemon=True).start()
+
+    def _show_export_format(s, a, u):
+        """Show export format selector in palette editor panel."""
+        if dpg.does_item_exist("pal_export_format_panel"):
+            dpg.configure_item("pal_export_format_panel", show=True)
+        if dpg.does_item_exist("pal_edit_main"):
+            dpg.configure_item("pal_edit_main", show=False)
+
+    def _hide_export_format(s, a, u):
+        """Hide export format selector in palette editor panel."""
+        if dpg.does_item_exist("pal_export_format_panel"):
+            dpg.configure_item("pal_export_format_panel", show=False)
+        if dpg.does_item_exist("pal_edit_main"):
+            dpg.configure_item("pal_edit_main", show=True)
+
+    def _execute_palette_export(fmt):
+        """Perform the actual palette export."""
+        if not app._editing_pal or app._editing_pal not in app.palettes:
+            _hide_export_format(None, None, None)
+            return
+        
+        with _palettes_lock:
+            colors = list(app.palettes[app._editing_pal])
+        
+        if fmt == "HTML":
+            h = (
+                f"<html><head><meta charset='utf-8'>HTMLTITLE_PLACEHOLDER{_HCSS}</head><body>"
+                f"<h2>HTMLH2_PLACEHOLDER</h2>"
+                f"<table>{_html_table_header()}"
+            )
+            for v in colors:
+                h += _html_color_row(v[0], v[1], v[2])
+            h += "</table></body></html>"
+            _save_html_dialog(h, app._editing_pal)
+        elif fmt == "ASE":
+            _save_ase_dialog(colors, app._editing_pal)
+        elif fmt == "ACO":
+            _save_aco_dialog(colors, app._editing_pal)
+        elif fmt == "GPL":
+            _save_gpl_dialog(colors, app._editing_pal)
+        elif fmt == "Procreate":
+            _save_swatches_dialog(colors, app._editing_pal)
+        
+        _hide_export_format(None, None, None)
+
+    def _import_open_dialog(s, a, u):
+        """Open a single file picker for all supported palette/image formats."""
+        def _run():
+            path = _win32_open_file(
+                "Import Palette",
+                [
+                    ("All supported formats",
+                     "*.ase;*.aco;*.gpl;*.swatches;"
+                     "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tiff;*.tif"),
+                    ("Palette files", "*.ase;*.aco;*.gpl;*.swatches"),
+                    ("Image files",
+                     "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tiff;*.tif"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if path:
+                _import_from_path(path)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _navigate_to_palettes():
+        """Switch the lower tab bar to the Palettes tab."""
+        if dpg.does_item_exist("bottom_tab_bar") and dpg.does_item_exist("tab_palettes"):
+            dpg.set_value("bottom_tab_bar", "tab_palettes")
+
+    def _open_drop_preview(colors, fname):
+        """Show the drop preview panel with parsed palette colors."""
+        _navigate_to_palettes()
+        if not dpg.does_item_exist("drop_preview_win"):
+            return
+        # Rebuild color swatches
+        if dpg.does_item_exist("drop_preview_colors"):
+            dpg.delete_item("drop_preview_colors", children_only=True)
+            for row_start in range(0, len(colors), _IMG_PREVIEW_COLS):
+                grp = dpg.add_group(parent="drop_preview_colors", horizontal=True)
+                dpg.bind_item_theme(grp, _nospc_theme)
+                for c in colors[row_start: row_start + _IMG_PREVIEW_COLS]:
+                    dpg.add_color_button(
+                        parent=grp, default_value=c,
+                        width=PAL_SW, height=PAL_SW,
+                        no_alpha=True, no_border=True,
+                    )
+        if dpg.does_item_exist("drop_preview_label"):
+            dpg.configure_item("drop_preview_label",
+                               default_value=f"{fname}  ({len(colors)} colors)")
+        # Hide normal palette views, show preview
+        for tag in ("pal_scroll", "pal_edit_win", "img_import_win"):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, show=False)
+        if dpg.does_item_exist("pal_import_buttons"):
+            dpg.configure_item("pal_import_buttons", show=False)
+        dpg.configure_item("drop_preview_win", show=True)
+
+    def _close_drop_preview():
+        """Hide the drop preview panel and restore normal Palettes view."""
+        if dpg.does_item_exist("drop_preview_win"):
+            dpg.configure_item("drop_preview_win", show=False)
+        if dpg.does_item_exist("pal_import_buttons"):
+            dpg.configure_item("pal_import_buttons", show=True)
+        editing = bool(app._editing_pal)
+        if dpg.does_item_exist("pal_scroll"):
+            dpg.configure_item("pal_scroll", show=not editing)
+        if dpg.does_item_exist("pal_edit_win"):
+            dpg.configure_item("pal_edit_win", show=editing)
 
     # -- Eyedropper ───────────────────────────────────────────────────────
     def pipette_thread():
         app.pipette_active = True
-
 
         WH_MOUSE_LL    = 14
         WM_MOUSEMOVE   = 0x0200
@@ -1768,7 +2138,7 @@ try:
             ctypes.c_longlong,
             ctypes.c_int,
             ctypes.c_size_t,
-            ctypes.c_size_t,
+            ctypes.c_ssize_t,   # lParam is LPARAM — signed pointer-sized integer
         )
 
         # Latest mouse position used by the capture thread.
@@ -1808,7 +2178,12 @@ try:
             hdc_mem    = _gdi32.CreateCompatibleDC(hdc_screen)
             # 1x1 bitmap for the memory DC
             hbmp_1px = _gdi32.CreateCompatibleBitmap(hdc_screen, 1, 1)
-            _gdi32.SelectObject(hdc_mem, hbmp_1px)
+            # FIX: SelectObject returns the previously-selected object. We must
+            # restore it before calling DeleteObject(hbmp_1px), otherwise Win32
+            # refuses to delete a bitmap that is still selected into a DC — the
+            # call silently fails and the bitmap leaks into the GDI object pool
+            # for the lifetime of the process (one leak per eyedropper session).
+            _old_bmp = _gdi32.SelectObject(hdc_mem, hbmp_1px)
             try:
                 while app.pipette_active:
                     _pip_event.wait(timeout=0.05)
@@ -1820,7 +2195,7 @@ try:
                         # SRCCOPY=0xCC0020: copy 1x1 pixel from screen to memory DC
                         _gdi32.BitBlt(hdc_mem, 0, 0, 1, 1, hdc_screen, x, y, 0xCC0020)
                         pixel = _gdi32.GetPixel(hdc_mem, 0, 0)
-                        if pixel != -1:
+                        if pixel != 0xFFFFFFFF:
                             r2 = pixel & 0xFF
                             g2 = (pixel >> 8) & 0xFF
                             b2 = (pixel >> 16) & 0xFF
@@ -1829,6 +2204,9 @@ try:
                     except Exception:
                         pass
             finally:
+                # Deselect hbmp_1px from the DC before destroying it.
+                # DeleteObject on a selected bitmap silently fails on Win32.
+                _gdi32.SelectObject(hdc_mem, _old_bmp)
                 _gdi32.DeleteObject(hbmp_1px)
                 _gdi32.DeleteDC(hdc_mem)
                 _u32cap.ReleaseDC(0, hdc_screen)
@@ -1877,15 +2255,19 @@ try:
         ]
         _hook_id[0] = _user32.SetWindowsHookExW(WH_MOUSE_LL, _cb, None, 0)
 
-        # Message loop — required for WH_MOUSE_LL; hook does not fire without it
+        # Message loop — required for WH_MOUSE_LL; hook does not fire without it.
+        # try/finally guarantees UnhookWindowsHookEx even if an exception propagates
+        # through DispatchMessageW — an orphaned WH_MOUSE_LL hook slows the entire
+        # system mouse until the process exits.
         _msg = _wt.MSG()
-        while _user32.GetMessageW(ctypes.byref(_msg), None, 0, 0) > 0:
-            _user32.TranslateMessage(ctypes.byref(_msg))
-            _user32.DispatchMessageW(ctypes.byref(_msg))
-
-        if _hook_id[0]:
-            _user32.UnhookWindowsHookEx(_hook_id[0])
-            _hook_id[0] = None
+        try:
+            while _user32.GetMessageW(ctypes.byref(_msg), None, 0, 0) > 0:
+                _user32.TranslateMessage(ctypes.byref(_msg))
+                _user32.DispatchMessageW(ctypes.byref(_msg))
+        finally:
+            if _hook_id[0]:
+                _user32.UnhookWindowsHookEx(_hook_id[0])
+                _hook_id[0] = None
         app._pipette_thread_tid = 0
 
     _pipette_lock = threading.Lock()
@@ -1940,6 +2322,10 @@ try:
         "</style>"
     )
 
+    def _html_copy_btn(val):
+        """Return an HTML Copy button that copies `val` to the clipboard via the cc() JS function."""
+        return f"<button class=\"cb\" onclick=\"cc(\'{val}\',this)\">Copy</button>"
+
     def _html_color_row(r, g, b):
         """Return an HTML <tr> with colour data columns and a Copy button."""
         hx  = f"#{r:02x}{g:02x}{b:02x}".upper()
@@ -1968,13 +2354,10 @@ try:
         cw_cls, cw_lbl = _wcag_cls(cw)
         cb_cls, cb_lbl = _wcag_cls(cb)
 
-        def _btn(val):
-            return f"<button class=\"cb\" onclick=\"cc(\'{val}\',this)\">Copy</button>"
-
         return (
             f"<tr>"
             f"<td><span class=\"sw\" style=\"background:{hx}\"></span></td>"
-            f"<td class=\"mono\">{hx} {_btn(hx)}</td>"
+            f"<td class=\"mono\">{hx} {_html_copy_btn(hx)}</td>"
             f"<td class=\"mono\">{rgb}</td>"
             f"<td class=\"mono\">{hsl}</td>"
             f"<td class=\"mono\">{hsv}</td>"
@@ -2010,10 +2393,11 @@ try:
                 )
                 if path:
                     title = os.path.splitext(os.path.basename(path))[0]
+                    safe_title = _html.escape(title)
                     final = content.replace(
                         'HTMLTITLE_PLACEHOLDER',
-                        f'<title>{title}</title>'
-                    ).replace('HTMLH2_PLACEHOLDER', title)
+                        f'<title>{safe_title}</title>'
+                    ).replace('HTMLH2_PLACEHOLDER', safe_title)
                     with open(path, 'w', encoding='utf-8') as f:
                         f.write(final)
                     os.startfile(path)
@@ -2024,7 +2408,7 @@ try:
 
     def _save_ase_dialog(colors, default_name):
         """Save colours as an ASE file in a background thread."""
-        def _build_ase(palette_name, color_list):
+        def _build_ase(color_list):
             # Standalone color entries without group wrapper.
             # Group blocks (0xC002/0xC003) cause import failures in several apps.
             # Color type 2 = normal (0=global, 1=spot); normal has widest compatibility.
@@ -2058,8 +2442,7 @@ try:
                     initial_name=default_name,
                 )
                 if path:
-                    pal_name = os.path.splitext(os.path.basename(path))[0]
-                    data = _build_ase(pal_name, colors)
+                    data = _build_ase(colors)
                     with open(path, 'wb') as f:
                         f.write(data)
             except Exception as e:
@@ -2067,12 +2450,135 @@ try:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def export_palette_ase_by_name(name):
-        with _palettes_lock:
-            if not name or name not in app.palettes:
-                return
-            colors = list(app.palettes[name])
-        _save_ase_dialog(colors, name)
+    def _save_aco_dialog(colors, default_name):
+        """Save colours as an ACO (Adobe Color) file in a background thread."""
+        def _build_aco(color_list):
+            # ACO format: V1 block followed by V2 block (with color names).
+            # Both blocks are required for maximum compatibility with viewers.
+            # Each entry: 2-byte color space (0=RGB) + 4 × 2-byte components + (V2 only: name)
+            n = len(color_list)
+
+            def _encode_color(c):
+                r16 = (c[0] << 8) | c[0]
+                g16 = (c[1] << 8) | c[1]
+                b16 = (c[2] << 8) | c[2]
+                return struct.pack('>HHHHH', 0, r16, g16, b16, 0)
+
+            # V1 block
+            v1 = struct.pack('>HH', 1, n)
+            for c in color_list:
+                v1 += _encode_color(c)
+
+            # V2 block: same color data + Pascal string name (UTF-16 BE, null-terminated)
+            v2 = struct.pack('>HH', 2, n)
+            for i, c in enumerate(color_list):
+                name = f"Color {i + 1}"
+                encoded = (name + '\x00').encode('utf-16-be')
+                v2 += _encode_color(c)
+                v2 += struct.pack('>HH', 0, len(name) + 1) + encoded
+
+            return v1 + v2
+
+        def _run():
+            try:
+                path = _win32_save_file(
+                    "Export ACO",
+                    [("Adobe Color", "*.aco"), ("All files", "*.*")],
+                    default_ext=".aco",
+                    initial_name=default_name,
+                )
+                if path:
+                    data = _build_aco(colors)
+                    with open(path, 'wb') as f:
+                        f.write(data)
+            except Exception as e:
+                _write_log(f"ACO export error: {e}\n" + traceback.format_exc())
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _save_gpl_dialog(colors, default_name):
+        """Save colours as a GPL (GIMP Palette) file in a background thread."""
+        def _build_gpl(palette_name, color_list):
+            # GPL format: text-based GIMP palette
+            # Header lines, then RGB values with optional names
+            lines = [
+                "GIMP Palette",
+                f"Name: {palette_name}",
+                "Columns: 16",
+                "#",
+            ]
+            for c in color_list:
+                hex_val = f"{c[0]:02X}{c[1]:02X}{c[2]:02X}"
+                lines.append(f"{c[0]:3d} {c[1]:3d} {c[2]:3d}     #{hex_val}")
+            
+            return "\n".join(lines).encode('utf-8')
+
+        def _run():
+            try:
+                path = _win32_save_file(
+                    "Export GPL",
+                    [("GIMP Palette", "*.gpl"), ("All files", "*.*")],
+                    default_ext=".gpl",
+                    initial_name=default_name,
+                )
+                if path:
+                    pal_name = os.path.splitext(os.path.basename(path))[0]
+                    data = _build_gpl(pal_name, colors)
+                    with open(path, 'wb') as f:
+                        f.write(data)
+            except Exception as e:
+                _write_log(f"GPL export error: {e}\n" + traceback.format_exc())
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _save_swatches_dialog(colors, default_name):
+        """Save colours as a Procreate .swatches file in a background thread.
+        Format: ZIP archive containing a swatches.json.
+        """
+
+        def _build_swatches(palette_name, color_list):
+            swatches = []
+            for c in color_list:
+                r, g, b = c[0] / 255.0, c[1] / 255.0, c[2] / 255.0
+                hue, saturation, brightness = colorsys.rgb_to_hsv(r, g, b)
+                swatches.append({
+                    "hue":        hue,
+                    "saturation": saturation,
+                    "brightness": brightness,
+                    "alpha":      1.0,
+                    "colorSpace": 0,
+                    "red":   r,
+                    "green": g,
+                    "blue":  b,
+                })
+
+            # Pad to 30 swatches (Procreate palette grid is 5x6)
+            while len(swatches) < 30:
+                swatches.append(None)
+
+            doc = {"name": palette_name, "swatches": swatches}
+            return json.dumps(doc, separators=(',', ':')).encode('utf-8')
+
+        def _run():
+            try:
+                path = _win32_save_file(
+                    "Export Procreate Swatches",
+                    [("Procreate Swatches", "*.swatches"), ("All files", "*.*")],
+                    default_ext=".swatches",
+                    initial_name=default_name,
+                )
+                if path:
+                    pal_name = os.path.splitext(os.path.basename(path))[0]
+                    json_data = _build_swatches(pal_name, colors)
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr("Swatches.json", json_data)
+                    with open(path, 'wb') as f:
+                        f.write(buf.getvalue())
+            except Exception as e:
+                _write_log(f"Swatches export error: {e}\n" + traceback.format_exc())
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def export_palette():
         h = (
@@ -2115,6 +2621,13 @@ try:
         except Exception:
             _write_log("_minimize_win error:\n" + traceback.format_exc())
 
+    # Win32 argtypes for titlebar drag (MoveWindow).
+    ctypes.windll.user32.MoveWindow.restype  = ctypes.c_bool
+    ctypes.windll.user32.MoveWindow.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_bool,
+    ]
+
     def set_theme(s, v):
         name = v if v in _THEME_MAP else "Dark"
         app.theme_name = name
@@ -2136,8 +2649,7 @@ try:
                 dpg.add_theme_color(dpg.mvThemeCol_Border, border_col,
                                     category=dpg.mvThemeCat_Core)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 2)
-        except Exception:
-            pass
+        except Exception: pass
 
     def slider_mode_cb(s, v):
         app.slider_mode = v
@@ -2147,23 +2659,70 @@ try:
 
     def harmony_combo_cb(s, v):
         app.harmony_mode = v
+        _scroll_mode = v in ("Tints", "Shades", "Tones")
+        _vw = VALW_SCROLL if _scroll_mode else VALW
+        for _t in HARMONY_TAGS:
+            if dpg.does_item_exist(f"val_{_t}"):
+                dpg.configure_item(f"val_{_t}", width=_vw)
+            # FIX: ctr_grp_{tag} width was hardcoded to VALW at build time and
+            # never updated when the scrollbar appears. In scroll mode the contrast
+            # panel overflows under the scrollbar, hiding the W/B labels. Keep it
+            # in sync with the text-field width so both shrink together.
+            if dpg.does_item_exist(f"ctr_grp_{_t}"):
+                dpg.configure_item(f"ctr_grp_{_t}", width=_vw)
+        _redraw_harmony_combo_icon(v)
+
+    def _redraw_harmony_combo_icon(mode_name):
+        if not dpg.does_item_exist("hm_icon_dl"):
+            return
+        dpg.delete_item("hm_icon_dl", children_only=True)
+        _D = _sc(48); _R = _sc(18)
+        _CX = _D // 2; _CY = _D // 2; _DR = _sc(5)
+        _BASE = -math.pi / 2
+        angles, ts = _HARMONY_ICON_DATA.get(mode_name, ([], None))
+        dpg.draw_circle(parent="hm_icon_dl",
+            center=(_CX, _CY), radius=_R, color=[100, 100, 100, 180], thickness=1)
+        if ts:
+            step = (_D - _sc(10)) // 4
+            for i in range(5):
+                tx = _sc(5) + i * step
+                t  = i / 4.0
+                if ts == "tint":
+                    c = [int(100+155*t), int(60+100*t), int(20+40*t), 255]
+                elif ts == "shade":
+                    c = [int(200-180*t), int(80-70*t), int(20-15*t), 255]
+                else:
+                    c = [int(120+40*t), int(80+40*t), int(20+20*t), 255]
+                dpg.draw_circle(parent="hm_icon_dl",
+                    center=(tx, _CY), radius=_sc(4), color=[0,0,0,0], fill=c)
+        else:
+            bx = int(_CX + _R * math.cos(_BASE))
+            by = int(_CY + _R * math.sin(_BASE))
+            for deg in angles:
+                a  = _BASE + math.radians(deg)
+                hx = int(_CX + _R * math.cos(a))
+                hy = int(_CY + _R * math.sin(a))
+                dpg.draw_line(parent="hm_icon_dl",
+                    p1=(_CX, _CY), p2=(hx, hy), color=[80, 80, 80, 140], thickness=1)
+                dpg.draw_circle(parent="hm_icon_dl",
+                    center=(hx, hy), radius=_DR, color=[0,0,0,0], fill=[80, 160, 255, 255])
+            dpg.draw_line(parent="hm_icon_dl",
+                p1=(_CX, _CY), p2=(bx, by), color=[80, 80, 80, 140], thickness=1)
+            dpg.draw_circle(parent="hm_icon_dl",
+                center=(bx, by), radius=_DR, color=[0,0,0,0], fill=[255, 200, 50, 255])
 
     def fmt_combo_cb(s, v):
         app.fmt_mode = v
         refresh_harmony_values()
-
-    def toggle_mode(s, v):
-        app.use_wheel = not app.use_wheel
-        if app.use_wheel:
-            dpg.configure_item("grp_wheel",       show=True)
-            dpg.configure_item("grp_sliders_all", show=False)
-            dpg.set_item_label("btn_mode", "Sliders")
-        else:
-            dpg.configure_item("grp_wheel",       show=False)
-            dpg.configure_item("grp_sliders_all", show=True)
-            dpg.set_item_label("btn_mode", "Color Wheel")
+    def _on_top_tab(tab_name):
+        """Called when the user selects one of the main tabs."""
+        app.top_tab  = tab_name
+        app.use_wheel = (tab_name == "wheel")
+        if tab_name == "sliders":
             _sync_all_modes()
             app._last_sl_vals = {}
+        else:
+            _update_wheel_contrast()
 
     # ─────────────────────────────────────────────────────────────────────
     #  UI BUILD
@@ -2173,7 +2732,7 @@ try:
     # Mouse wheel handler via DPG — works only while the viewport is active
     with dpg.handler_registry():
         dpg.add_mouse_wheel_handler(
-            callback=lambda s, a, u: setattr(app, '_mouse_wheel_delta', a)
+            callback=lambda s, a, u: setattr(app, '_mouse_wheel_delta', app._mouse_wheel_delta + a)
         )
 
     # ── Logo textures ──────────────────────────────────────────────────────────────
@@ -2213,10 +2772,31 @@ try:
 
     _VP_W        = int(283 * _DPI_SCALE)
 
+    # ── Font registry — large font for contrast sample buttons ────────────
+    _font_large = None
+    _FONT_PATHS = [
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\calibri.ttf",
+    ]
+    with dpg.font_registry():
+        for _fp in _FONT_PATHS:
+            if os.path.exists(_fp):
+                _font_large = dpg.add_font(_fp, int(22 * _DPI_SCALE))
+                break
+
     with dpg.theme() as _nospc_theme:
         with dpg.theme_component(dpg.mvAll):
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing,  0, 0)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+
+    with dpg.theme() as _nopad_cw_theme:
+        with dpg.theme_component(dpg.mvChildWindow):
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
+
+    with dpg.theme() as _tight_text_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 1)
 
     with dpg.theme() as _dark_theme:
         with dpg.theme_component(dpg.mvAll):
@@ -2230,6 +2810,13 @@ try:
             dpg.add_theme_color(dpg.mvThemeCol_Header,         [60,  60,  60,  255])
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [30,  30,  30,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [20,  20,  20,  255])
+            # FIX: Tab/Separator colors were missing — all other themes define them.
+            # Without these, DPG falls back to ImGui's blue defaults (e.g. TabActive ~#3468AE),
+            # which look wrong against the dark grey background.
+            dpg.add_theme_color(dpg.mvThemeCol_Tab,            [45,  45,  45,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [80,  80,  80,  200])
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [60,  60,  60,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_Separator,      [55,  55,  55,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding,   4, 3)
 
@@ -2253,6 +2840,12 @@ try:
             dpg.add_theme_color(dpg.mvThemeCol_TabUnfocusedActive, [66,  150, 250, 255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,  2)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 3)
+
+    with dpg.theme() as _close_btn_theme:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button,        [180, 50, 50, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, [220, 80, 80, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Text,          [255, 255, 255, 255])
 
     with dpg.theme() as _midnight_theme:
         with dpg.theme_component(dpg.mvAll):
@@ -2330,6 +2923,25 @@ try:
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding,   4, 3)
 
+    with dpg.theme() as _black_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg,       [0,   0,   0,   255])
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg,        [0,   0,   0,   255])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg,        [50,  50,  50,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, [70,  70,  70,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_Text,           [230, 230, 230, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Button,         [45,  45,  45,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered,  [70,  70,  70,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_Header,         [60,  60,  60,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [15,  15,  15,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [0,   0,   0,   255])
+            dpg.add_theme_color(dpg.mvThemeCol_Tab,            [45,  45,  45,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [110, 110, 110, 200])
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [100, 100, 100, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Separator,      [55,  55,  55,  255])
+            dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding,   4, 3)
+
     with dpg.theme() as _new_palette_select_theme:
         with dpg.theme_component(dpg.mvButton):
             dpg.add_theme_color(dpg.mvThemeCol_Button,        [0, 150, 0, 255])
@@ -2390,6 +3002,13 @@ try:
             dpg.add_theme_style(dpg.mvStyleVar_WindowPadding,  0, _sc(5))
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing,    _sc(2), 0)
 
+    with dpg.theme() as _titlebar_black_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg,        [0, 0, 0, 255])
+            dpg.add_theme_color(dpg.mvThemeCol_Border,         [0, 0, 0, 255])
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding,  0, _sc(5))
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing,    _sc(2), 0)
+
     _THEME_MAP = {
         "Dark":      (_dark_theme,      _titlebar_dark_theme,      False),
         "Light":     (_light_theme,     _titlebar_light_theme,     True),
@@ -2397,6 +3016,7 @@ try:
         "Mocha":     (_mocha_theme,     _titlebar_mocha_theme,     False),
         "Nord":      (_nord_theme,      _titlebar_nord_theme,      False),
         "Solarized": (_solarized_theme, _titlebar_solarized_theme, False),
+        "Black":     (_black_theme,     _titlebar_black_theme,     False),
     }
     THEME_NAMES = list(_THEME_MAP.keys())
 
@@ -2410,12 +3030,28 @@ try:
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing,   6, 3)
 
 
+    def _slval_input_cb(sender, val, user_data):
+        gname = user_data
+        smin, smax = _SLIDER_RANGE[gname]
+        app.sl_vals[gname] = max(smin, min(smax, val))
+        mode = _GNAME_MODE.get(gname)
+        if mode:
+            _apply_from_mode(mode)
+            _update_selected_pal_color()
+            _update_wheel_contrast()
+
     def _make_grad_slider(label, label_color, gname):
         with dpg.group(horizontal=True):
             dpg.add_text(label, color=label_color)
             dpg.add_drawlist(width=GRAD_W, height=THUMB_H, tag=f"dl_{gname}")
-            dpg.add_text("   ", tag=f"slval_{gname}")
-
+            dpg.add_input_int(
+                tag=f"slval_{gname}",
+                default_value=0,
+                width=_sc(52),
+                step=0, step_fast=0,
+                callback=_slval_input_cb,
+                user_data=gname,
+            )
     # ── Win32 eyedropper overlay ──────────────────────────────────────────
     # Created once on the main thread. The update() loop moves and repaints it.
 
@@ -2439,9 +3075,6 @@ try:
         | ((20 * _PIP_BG_A // 255) << 16)
         | (_PIP_BG_A << 24)
     )
-    # Pre-computed per-pixel byte patterns reused by _pip_draw every frame.
-    _PIP_BG_BYTES = _PIP_BG_VAL.to_bytes(4, "little")
-    _PIP_WH_BYTES = b"\xff\xff\xff\xff"
     _pip_pixel_template = (ctypes.c_uint32 * (_PIP_OW * _PIP_OH))()
     for _i in range(_PIP_OW * _PIP_OH):
         _pip_pixel_template[_i] = _PIP_BG_VAL
@@ -2518,9 +3151,6 @@ try:
             0, 0, _PIP_OW, _PIP_OH,
             None, None, _pip_hInst, None,
         )
-        if _pip_hwnd[0]:
-            pass  # Content drawn via UpdateLayeredWindow in _pip_overlay_update()
-
     _pip_pt = _wt.POINT()
 
     # ── UpdateLayeredWindow structures ──────────────────────────────
@@ -2552,11 +3182,8 @@ try:
         'hdc_screen': None,
         'hdc_mem':    None,
         'hbmp':       None,
+        'old_hbmp':   None,   # stock bitmap returned by SelectObject; restored before DeleteObject
         'bits_ptr':   None,
-        'pixels':     None,
-        'buf':        None,  # PERF: pre-allocated; reused every frame in _pip_draw
-        'ba':         None,  # PERF: pre-allocated bytearray; reused every frame
-        'ba_ctype':   None,  # PERF: ctypes view of ba — avoids from_buffer() every frame
     }
 
     # GDI/User32 argtypes — set once here so _pip_init_gdi() has no overhead.
@@ -2609,25 +3236,27 @@ try:
             hdc_mem, ctypes.byref(bmi), 0,
             ctypes.byref(bits_ptr), None, 0)
         if hbmp:
-            _pip_g32.SelectObject(hdc_mem, hbmp)
+            # SelectObject returns the previously-selected object (the stock bitmap).
+            # We must restore it before DeleteObject — Win32 silently refuses to
+            # delete a bitmap that is still selected into a DC, causing a GDI leak.
+            _old_hbmp = _pip_g32.SelectObject(hdc_mem, hbmp)
             _pip_gdi['hdc_screen'] = hdc_screen
             _pip_gdi['hdc_mem']    = hdc_mem
             _pip_gdi['hbmp']       = hbmp
+            _pip_gdi['old_hbmp']   = _old_hbmp   # kept so _pip_free_gdi can restore it
             _pip_gdi['bits_ptr']   = bits_ptr
-            _pip_gdi['pixels']     = (ctypes.c_uint32 * (_PIP_OW * _PIP_OH))()
-            # Allocated once; reused by _pip_draw every frame (~420 kB/s GC pressure avoided).
-            _pip_gdi['buf']        = (ctypes.c_char * (4 * _PIP_OW * _PIP_OH))()
-            _pip_gdi['ba']         = bytearray(4 * _PIP_OW * _PIP_OH)
-            # Fixed ctypes view of ba — avoids from_buffer() allocation every frame.
-            _pip_gdi['ba_ctype']   = (ctypes.c_char * (4 * _PIP_OW * _PIP_OH)).from_buffer(
-                _pip_gdi['ba']
-            )
+            # DEAD CODE REMOVED: pix_view (uint32 ctypes array view of DIB memory)
+            # was stored here but never read — _pip_draw uses bits_ptr + memmove directly.
         else:
             _pip_g32.DeleteDC(hdc_mem)
             _pip_u32.ReleaseDC(None, hdc_screen)
 
     def _pip_free_gdi():
         """Free GDI resources at shutdown."""
+        if _pip_gdi['hdc_mem'] and _pip_gdi.get('old_hbmp'):
+            # Deselect our DIB before deleting it — Win32 silently fails to
+            # DeleteObject a bitmap that is still selected into a DC.
+            _pip_g32.SelectObject(_pip_gdi['hdc_mem'], _pip_gdi['old_hbmp'])
         if _pip_gdi['hbmp']:
             _pip_g32.DeleteObject(_pip_gdi['hbmp'])
         if _pip_gdi['hdc_mem']:
@@ -2636,6 +3265,15 @@ try:
             _pip_u32.ReleaseDC(None, _pip_gdi['hdc_screen'])
         for k in _pip_gdi:
             _pip_gdi[k] = None
+
+    # Pre-allocate a single swatch row buffer — reused every frame.
+    _PIP_SW_INNER = _PIP_SW - 8  # inset: 4px each side
+    _pip_sw_row = (ctypes.c_uint32 * _PIP_SW_INNER)()
+    _pip_sw_row_bytes = ctypes.sizeof(_pip_sw_row)
+    # Pre-allocate a text-area row buffer for alpha fixup.
+    _PIP_TEXT_W = _PIP_OW - _PIP_SW
+    _pip_txt_row = (ctypes.c_uint32 * _PIP_TEXT_W)()
+    _pip_txt_row_bytes = ctypes.sizeof(_pip_txt_row)
 
     def _pip_draw(ox, oy, pr, pg, pb):
         """Draw the eyedropper overlay via UpdateLayeredWindow (per-pixel alpha).
@@ -2650,21 +3288,26 @@ try:
         hdc_screen = _pip_gdi['hdc_screen']
         hdc_mem    = _pip_gdi['hdc_mem']
         bits_ptr   = _pip_gdi['bits_ptr']
-        pixels     = _pip_gdi['pixels']
         if hdc_screen is None:
             return
+        # DEAD CODE REMOVED: _pix = _pip_gdi['pix_view'] was fetched here but
+        # never used — pixel writes go through bits_ptr + ctypes.memmove instead.
 
-        # ── 1. Copy the pre-built template: background + black text area ────
-        ctypes.memmove(pixels, _pip_pixel_template, ctypes.sizeof(pixels))
+        # ── 1. Copy the pre-built template directly to DIB ─────────────────
+        ctypes.memmove(bits_ptr, _pip_pixel_template,
+                        _PIP_OW * _PIP_OH * ctypes.sizeof(ctypes.c_uint32))
 
-        # ── 2. Swatch: fully opaque (alpha=255, pre-mult = value as-is)
+        # ── 2. Swatch: fill row buffer once, memmove per row (no Python per-pixel loop)
         sw_val = pb | (pg << 8) | (pr << 16) | (255 << 24)
+        for _k in range(_PIP_SW_INNER):
+            _pip_sw_row[_k] = sw_val
+        _row_stride = _PIP_OW * 4  # bytes per row in DIB
+        _sw_x_off   = 4 * 4        # byte offset of column 4 in a row
         for sy in range(4, _PIP_OH - 4):
-            for sx in range(4, _PIP_SW - 4):
-                pixels[sy * _PIP_OW + sx] = sw_val
+            dst = bits_ptr.value + sy * _row_stride + _sw_x_off
+            ctypes.memmove(dst, _pip_sw_row, _pip_sw_row_bytes)
 
-        # ── 3. Copy pixels to DIB memory and draw text via GDI ────────────
-        ctypes.memmove(bits_ptr, pixels, ctypes.sizeof(pixels))
+        # ── 3. Draw text via GDI ──────────────────────────────────────────
 
         hex_str = f"#{pr:02X}{pg:02X}{pb:02X}"
         _pip_g32.SetBkMode(hdc_mem, 2)       # OPAQUE
@@ -2673,35 +3316,21 @@ try:
         rc3 = _wt.RECT(_PIP_SW, 0, _PIP_OW - 2, _PIP_OH)
         _pip_u32.DrawTextW(hdc_mem, hex_str, -1, ctypes.byref(rc3), 0x0025)
 
-        # ── 4. Fix alpha in the text area (optimised: single scan with bitmask)
-        # Text pixels (drawn by GDI in white) show up as bright (B-channel > 40).
-        # All other pixels in the text area are restored to the background colour.
-        # GDI DrawText writes white text on a black background (BGRA format).
-        # In the text area (tx >= _PIP_SW): B-channel > 40 => text pixel => 0xFFFFFFFF,
-        # otherwise restore background.
-        # Note: DIB format is BGRA (little-endian), so byte order is B,G,R,A.
-        # PERF: uses pre-allocated buffers — no allocation per frame
-        buf = _pip_gdi['buf']
-        ba  = _pip_gdi['ba']
-        ctypes.memmove(buf, bits_ptr, ctypes.sizeof(buf))
-        ba[:] = buf
-        _bg_bytes = _PIP_BG_BYTES
-        _wh_bytes = _PIP_WH_BYTES
-        row_stride = _PIP_OW * 4
-        text_col_start = _PIP_SW * 4
-        for ty in range(_PIP_OH):
-            row_off = ty * row_stride
-            for tx4 in range(text_col_start, row_stride, 4):
-                idx = row_off + tx4
-                # B-channel is at byte idx (BGRA). GDI writes only
-                # bright pixels as white — all channels > 40 when text.
-                # Checking only the B-channel is sufficient to distinguish text pixels.
-                if ba[idx] > 40:
-                    ba[idx:idx+4] = _wh_bytes
+        # ── 4. Fix alpha in the text area — row-based memmove + scan.
+        # GDI DrawText writes white text on black but does not set alpha.
+        # Text pixels (B-channel > 40) → 0xFFFFFFFF, others → background.
+        _bg  = _PIP_BG_VAL
+        _txt_x_off = _PIP_SW * 4  # byte offset of text-area start
+        for _ty in range(_PIP_OH):
+            src = bits_ptr.value + _ty * _row_stride + _txt_x_off
+            ctypes.memmove(_pip_txt_row, src, _pip_txt_row_bytes)
+            for _k in range(_PIP_TEXT_W):
+                if (_pip_txt_row[_k] & 0xFF) > 40:
+                    _pip_txt_row[_k] = 0xFFFFFFFF
                 else:
-                    ba[idx:idx+4] = _bg_bytes
-        # Use the pre-created ctypes view — avoids from_buffer() per frame.
-        ctypes.memmove(bits_ptr, _pip_gdi['ba_ctype'], len(ba))
+                    _pip_txt_row[_k] = _bg
+            # Always write back (background values also need alpha set)
+            ctypes.memmove(src, _pip_txt_row, _pip_txt_row_bytes)
 
         # UpdateLayeredWindow
         pt_dst = _wt.POINT(ox, oy)
@@ -2766,12 +3395,24 @@ try:
             _pip_u32.DispatchMessageW(ctypes.byref(_msg))
         if app.pipette_active:
             _pip_u32.GetCursorPos(ctypes.byref(_pip_pt))
-            sw = _pip_u32.GetSystemMetrics(0)
-            sh = _pip_u32.GetSystemMetrics(1)
-            ox = _pip_pt.x + 18
-            oy = _pip_pt.y + 18
-            if ox + _PIP_OW > sw: ox = _pip_pt.x - _PIP_OW - 4
-            if oy + _PIP_OH > sh: oy = _pip_pt.y - _PIP_OH - 4
+            # FIX: GetSystemMetrics(0/1) returns primary-screen dimensions only.
+            # On multi-monitor setups where the cursor is on a secondary monitor
+            # (x > primary width), the old check was always True and forced the
+            # overlay to flip to the wrong side. Use SM_CXVIRTUALSCREEN (78) /
+            # SM_CYVIRTUALSCREEN (79) which span the full virtual desktop, and
+            # SM_XVIRTUALSCREEN (76) / SM_YVIRTUALSCREEN (77) for the origin
+            # (can be negative when monitors are arranged to the left/above).
+            _vx0 = _pip_u32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            _vy0 = _pip_u32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            _vsw = _pip_u32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            _vsh = _pip_u32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            # FIX: offset and fallback margin were hardcoded physical pixels (18, 4).
+            # At 200% DPI these are barely visible. Scale with _sc() like all other
+            # UI measurements so the overlay stays clear of the cursor at any DPI.
+            ox = _pip_pt.x + _sc(18)
+            oy = _pip_pt.y + _sc(18)
+            if ox + _PIP_OW > _vx0 + _vsw: ox = _pip_pt.x - _PIP_OW - _sc(4)
+            if oy + _PIP_OH > _vy0 + _vsh: oy = _pip_pt.y - _PIP_OH - _sc(4)
             with _pip_lock:
                 _pr, _pg, _pb = app.pip_color[0], app.pip_color[1], app.pip_color[2]
             _pip_draw(ox, oy, _pr, _pg, _pb)
@@ -2812,16 +3453,84 @@ try:
                 dpg.add_drawlist(width=_ICON_W, height=_TB_H, tag="dl_tb_close")
         dpg.add_spacer(height=2)
 
-        with dpg.group(horizontal=True):
-            dpg.add_button(
-                tag="btn_mode", label="Sliders",
-                callback=toggle_mode, width=BW, height=THUMB_H,
-            )
-            dpg.add_button(label="Color picker", callback=start_pipette, width=BW, height=THUMB_H)
+        # ── Main top-level tabs: Color Wheel / Sliders / Contrast ──────────
+        _TOP_VIEW_H = _sc(280)   # tab header (~23) + 8px spacer + wheel content (~242)
+        _TAB_NAMES  = {"   Wheel   ": "wheel", "  Sliders  ": "sliders", " Contrast  ": "contrast"}
+        def _main_tab_cb(s, active_tab, u):
+            label = dpg.get_item_label(active_tab)
+            _on_top_tab(_TAB_NAMES.get(label, "wheel"))
+        with dpg.child_window(
+            width=W, height=_TOP_VIEW_H, border=False, no_scrollbar=True, no_scroll_with_mouse=True, tag="top_view_cw",
+        ):
+            dpg.bind_item_theme("top_view_cw", _nopad_cw_theme)
+            with dpg.tab_bar(tag="main_tab_bar", callback=_main_tab_cb):
+
+                with dpg.tab(label="   Wheel   ", tag="tab_wheel"):
+                    with dpg.group(tag="grp_wheel"):
+                        dpg.add_spacer(height=_sc(8))
+                        _ir, _ig, _ib = [int(round(c * 255)) for c in app.current_color[:3]]
+                        dpg.add_color_picker(
+                            tag="picker_wheel", width=W,
+                            no_inputs=True, no_label=True,
+                            no_side_preview=True, no_small_preview=True,
+                            picker_mode=dpg.mvColorPicker_wheel,
+                            display_type=dpg.mvColorEdit_uint8,
+                            display_hsv=True,
+                            default_value=[_ir, _ig, _ib, 255],
+                            callback=picker_cb,
+                        )
+
+                with dpg.tab(label="  Sliders  ", tag="tab_sliders"):
+                    with dpg.group(tag="grp_sliders_all"):
+                        dpg.add_spacer(height=_sc(8))
+                        dpg.add_combo(
+                            SLIDER_MODES, tag="slider_mode_combo",
+                            default_value="RGB", width=W, callback=slider_mode_cb,
+                        )
+                        dpg.add_spacer(height=3)
+                        _SLIDER_AREA_H = _sc(215)
+                        with dpg.child_window(
+                            width=W, height=_SLIDER_AREA_H, border=False, no_scrollbar=True,
+                        ):
+                            for mode, sliders in SLIDERS_BY_MODE.items():
+                                with dpg.group(tag=f"grp_sl_{mode}", show=(mode == "RGB")):
+                                    for (_lbl, gname, lcol, smin, smax) in sliders:
+                                        _make_grad_slider(_lbl, lcol, gname)
+
+                with dpg.tab(label=" Contrast  ", tag="tab_contrast"):
+                    _BOX_H = _sc(32)
+                    _BOX_W = (W - _sc(7)) // 2
+                    dpg.add_spacer(height=_sc(6))
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="W --", tag="wheel_ctr_w",
+                            width=_BOX_W, height=_BOX_H)
+                        dpg.add_button(label="B --", tag="wheel_ctr_b",
+                            width=_BOX_W, height=_BOX_H)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="Sample Text", tag="wheel_preview_w_txt",
+                            width=_BOX_W, height=_BOX_H)
+                        dpg.add_button(label="Sample Text", tag="wheel_preview_b_txt",
+                            width=_BOX_W, height=_BOX_H)
+                    if _font_large is not None:
+                        dpg.bind_item_font("wheel_preview_w_txt", _font_large)
+                        dpg.bind_item_font("wheel_preview_b_txt", _font_large)
+                    dpg.add_spacer(height=_sc(4))
+                    with dpg.group() as _ctr_legend_grp:
+                        dpg.add_text("WCAG contrast ratio", color=[150, 150, 150, 255])
+                        dpg.add_text("Fail  < 3.0:1",  color=[200, 70,  70,  255])
+                        dpg.add_text("AA*     3.0:1  (large text only)", color=[230, 160, 40,  255])
+                        dpg.add_text("AA      4.5:1  (normal text)", color=[170, 220, 60,  255])
+                        dpg.add_text("AAA     7.0:1  (best readability)", color=[80,  210, 80,  255])
+                        dpg.add_spacer(height=_sc(2))
+                        dpg.add_text("W = white background", color=[120, 120, 120, 255])
+                        dpg.add_text("B = black background",  color=[120, 120, 120, 255])
+                    dpg.bind_item_theme(_ctr_legend_grp, _tight_text_theme)
+
         dpg.add_spacer(height=3)
 
+        # Color preview bar
         _PREV_SW = BW
-        _PREV_HW = W - BW - _sc(8) - _sc(8) - 20
+        _PREV_HW = W - BW - _sc(8)*2 - 20
         with dpg.group(horizontal=True):
             dpg.add_color_button(
                 tag="preview", width=_PREV_SW, height=THUMB_H,
@@ -2836,63 +3545,44 @@ try:
             )
             dpg.add_button(
                 label="C", width=20, height=THUMB_H,
-                callback=lambda s, a, u: pyperclip.copy(dpg.get_value("preview_hex")),
+                callback=lambda s, a, u: safe_copy(dpg.get_value("preview_hex")),
             )
+        dpg.add_button(
+            label="Pick Color",
+            width=W, height=THUMB_H,
+            callback=lambda s, a, u: start_pipette(),
+        )
         dpg.add_spacer(height=2)
 
-        with dpg.group(tag="grp_wheel", show=True):
-            _ir, _ig, _ib = [int(round(c * 255)) for c in app.current_color[:3]]
-            dpg.add_color_picker(
-                tag="picker_wheel", width=W,
-                no_inputs=True, no_label=True,
-                no_side_preview=True, no_small_preview=True,
-                picker_mode=dpg.mvColorPicker_wheel,
-                display_type=dpg.mvColorEdit_uint8,
-                display_hsv=True,
-                default_value=[_ir, _ig, _ib, 255],
-                callback=picker_cb,
-            )
-
-        with dpg.group(tag="grp_sliders_all", show=False):
-            dpg.add_combo(
-                SLIDER_MODES, tag="slider_mode_combo",
-                default_value="RGB", width=W, callback=slider_mode_cb,
-            )
-            dpg.add_spacer(height=3)
-            _SLIDER_AREA_H = _sc(215)
-            with dpg.child_window(
-                width=W, height=_SLIDER_AREA_H, border=False, no_scrollbar=True,
-            ):
-                for mode, sliders in SLIDERS_BY_MODE.items():
-                    with dpg.group(tag=f"grp_sl_{mode}", show=(mode == "RGB")):
-                        for (lbl, gname, lcol, smin, smax) in sliders:
-                            _make_grad_slider(lbl, lcol, gname)
-
         with dpg.child_window(
-            width=W, height=_sc(232), border=False, no_scrollbar=True,
+            width=W, height=_sc(238), border=False, no_scrollbar=True,
             no_scroll_with_mouse=True, tag="tab_area",
         ):
-            with dpg.tab_bar():
+            with dpg.tab_bar(tag="bottom_tab_bar"):
 
                 # -- Harmony ------------------------------------------
                 with dpg.tab(label="  Harmony  "):
                     dpg.add_spacer(height=1)
                     with dpg.group(horizontal=True):
-                        dpg.add_combo(
-                            ["Complementary", "Split Complementary", "Analogous",
-                             "Triadic", "Tetradic", "Rectangle", "Tints", "Shades", "Tones"],
-                            tag="harmony_combo", default_value="Triadic", width=170,
-                            callback=harmony_combo_cb,
-                        )
-                        dpg.add_combo(
-                            FORMAT_OPTIONS, tag="fmt_combo",
-                            default_value="HEX", width=89,
-                            callback=fmt_combo_cb,
-                        )
+                        with dpg.group():
+                            dpg.add_combo(
+                                ["Complementary", "Split Complementary", "Analogous",
+                                 "Triadic", "Tetradic", "Rectangle",
+                                 "Tints", "Shades", "Tones"],
+                                tag="harmony_combo", default_value="Triadic",
+                                width=_sc(212), callback=harmony_combo_cb,
+                            )
+                            dpg.add_combo(
+                                FORMAT_OPTIONS, tag="fmt_combo",
+                                default_value="HEX", width=_sc(212),
+                                callback=fmt_combo_cb,
+                            )
+                        dpg.add_drawlist(tag="hm_icon_dl", width=_sc(48), height=_sc(48))
+                    _redraw_harmony_combo_icon("Triadic")  # initial icon
                     dpg.add_spacer(height=1)
                     # Scrollable area for the 8 colour rows.
                     with dpg.child_window(
-                        width=W, height=_sc(147),
+                        width=W, height=_sc(118),
                         border=False, no_scrollbar=False,
                         tag="harmony_rows_scroll",
                     ):
@@ -2914,7 +3604,7 @@ try:
                                     _CTR_TXT_W = VALW
                                     with dpg.child_window(
                                         tag=f"ctr_grp_{tag}", show=False,
-                                        width=_CTR_TXT_W, height=_sc(48),
+                                        width=_CTR_TXT_W, height=_sc(54),
                                         border=False, no_scrollbar=True,
                                     ):
                                         # W/B ratio labels — normal left-to-right flow
@@ -2949,11 +3639,12 @@ try:
                     with dpg.group(horizontal=True):
                         dpg.add_button(
                             label="Export HTML",  callback=export_palette,
-                            width=(W - _sc(6)) // 2, height=THUMB_H,
+                            width=(W - _sc(6)) // 2 - 1, height=THUMB_H,
                         )
                         dpg.add_button(
-                            label="Save Palette", callback=save_harmony_as_palette,
-                            width=(W - _sc(6)) // 2, height=THUMB_H,
+                            label="Save Palette",
+                            callback=save_harmony_as_palette,
+                            width=(W - _sc(6)) // 2 + 1, height=THUMB_H,
                         )
 
                 # -- History ------------------------------------------
@@ -2989,21 +3680,17 @@ try:
                     )
 
                 # -- Palettes -----------------------------------------
-                with dpg.tab(label=" Palettes  "):
-                    with dpg.group(horizontal=True):
+                with dpg.tab(label=" Palettes  ", tag="tab_palettes"):
+                    with dpg.group(horizontal=False, tag="pal_import_buttons"):
                         dpg.add_button(
-                            label="Import from Image",
-                            callback=import_image_palette,
-                            width=(W - _sc(4)) // 2, height=THUMB_H,
+                            label="Import",
+                            callback=_import_open_dialog,
+                            width=W, height=THUMB_H,
                         )
-                        dpg.add_button(
-                            label="Import ASE",
-                            callback=import_ase_palette,
-                            width=(W - _sc(4)) // 2, height=THUMB_H,
-                        )
+                    
                     dpg.add_text("", tag="import_error_text", color=[220, 80, 80], show=False)
                     dpg.add_spacer(height=1)
-                    PAL_SCROLL_H = _sc(181)
+                    PAL_SCROLL_H = _sc(182)
                     with dpg.child_window(
                         width=W, height=PAL_SCROLL_H,
                         border=True, no_scrollbar=False,
@@ -3047,15 +3734,208 @@ try:
                             dpg.add_button(label="Cancel", width=_btn_w2, height=THUMB_H,
                                            callback=_image_import_cancel)
 
+                    # Drop preview panel — shown after drag-and-drop of palette files.
+                    with dpg.child_window(
+                        width=W, height=PAL_SCROLL_H,
+                        border=True, no_scrollbar=True,
+                        tag="drop_preview_win", show=False,
+                    ):
+                        dpg.add_text("", tag="drop_preview_label",
+                                     color=[180, 210, 255], wrap=W - _sc(16))
+                        dpg.add_spacer(height=_sc(4))
+                        with dpg.group(tag="drop_preview_colors"):
+                            pass  # filled by _open_drop_preview()
+                        dpg.add_spacer(height=_sc(6))
+                        dpg.add_text("Import this palette?", color=[200, 200, 200])
+                        dpg.add_spacer(height=_sc(4))
+                        _btn_dp = (W - _sc(8)) // 2
+                        with dpg.group(horizontal=True):
+                            def _drop_preview_ok(s, a, u):
+                                colors_to_commit = getattr(app, '_drop_preview_colors_pending', [])
+                                _close_drop_preview()
+                                app._drop_preview_colors_pending = []
+                                if colors_to_commit:
+                                    _commit_image_palette(colors_to_commit)
+                            def _drop_preview_cancel(s, a, u):
+                                app._drop_preview_colors_pending = []
+                                _close_drop_preview()
+                            dpg.add_button(label="Import",  width=_btn_dp, height=THUMB_H,
+                                           callback=_drop_preview_ok)
+                            dpg.add_button(label="Cancel",  width=_btn_dp, height=THUMB_H,
+                                           callback=_drop_preview_cancel)
+
+        # Options panel — hidden by default, toggled by the Options button below.
+        with dpg.child_window(
+            tag="options_panel", show=False,
+            width=W, height=_sc(238),
+            border=False, no_scrollbar=False,
+        ):
+            # ---- Appearance ----
+            dpg.add_text("Appearance", color=[160, 200, 255])
+            dpg.add_separator()
+            dpg.add_spacer(height=_sc(3))
+            with dpg.group(horizontal=True):
+                dpg.add_text("Theme:", color=[180, 180, 180])
+                dpg.add_combo(
+                    THEME_NAMES, tag="theme_combo",
+                    default_value=app.theme_name,
+                    width=_sc(120), callback=set_theme,
+                )
+            dpg.add_spacer(height=_sc(8))
+            # ---- Palette Editing ----
+            dpg.add_text("Palette Editing", color=[160, 200, 255])
+            dpg.add_separator()
+            dpg.add_spacer(height=_sc(3))
+            dpg.add_text(
+                "Click swatch    Select color\n"
+                "Drag swatch     Reorder\n"
+                "Right-click     Remove color\n"
+                "+ Add color     Add current color\n"
+                "Undo            Undo last change\n"
+                "Export          Save palette to file",
+                color=[180, 180, 180], wrap=W - _sc(16),
+            )
+            dpg.add_spacer(height=_sc(8))
+            # ---- Harmony modes ----
+            dpg.add_text("Harmony Modes", color=[160, 200, 255])
+            dpg.add_separator()
+            dpg.add_spacer(height=_sc(4))
+
+            # Small wheel diagram helper
+            _D  = _sc(38)          # icon canvas size
+            _R  = _sc(14)          # wheel circle radius
+            _CX = _D // 2          # center x
+            _CY = _D // 2          # center y
+            _DR = _sc(4)           # dot radius
+            _COL_RING  = [100, 100, 100, 180]
+            _COL_MAIN  = [255, 200,  50, 255]   # base color dot
+            _COL_HRM   = [ 80, 160, 255, 255]   # harmony dot
+            _COL_LINE  = [ 80,  80,  80, 140]
+            _BASE_A    = -math.pi / 2            # base dot at top
+
+            # 3-column grid: 3 modes per row to save vertical space
+            _MODES = [
+                ([180],          "Complementary",       "Opposite",    None),
+                ([150, 210],     "Split Comp.",         "Near opp.",   None),
+                ([30, -30],      "Analogous",           "Adjacent",    None),
+                ([120, 240],     "Triadic",             "3 steps",     None),
+                ([90, 180, 270], "Tetradic",            "4 steps",     None),
+                ([60, 180, 240], "Rectangle",           "Two pairs",   None),
+                ([],             "Tints",               "+white",      "tint"),
+                ([],             "Shades",              "+black",      "shade"),
+                ([],             "Tones",               "+gray",       "tone"),
+            ]
+            for row_i in range(0, len(_MODES), 3):
+                with dpg.group(horizontal=True):
+                    for angles, label, desc, tint_shd in _MODES[row_i:row_i+3]:
+                        with dpg.group():
+                            dl = dpg.add_drawlist(width=_D, height=_D)
+                            dpg.draw_circle(parent=dl,
+                                center=(_CX, _CY), radius=_R,
+                                color=_COL_RING, thickness=1)
+                            if tint_shd:
+                                step = (_D - _sc(6)) // 4
+                                for i in range(5):
+                                    tx = _sc(3) + i * step
+                                    if tint_shd == "tint":
+                                        t = i / 4.0
+                                        c = [int(100+155*t), int(60+100*t), int(20+40*t), 255]
+                                    elif tint_shd == "shade":
+                                        t = i / 4.0
+                                        c = [int(200-180*t), int(80-70*t), int(20-15*t), 255]
+                                    else:
+                                        t = i / 4.0
+                                        c = [int(120+40*t), int(80+40*t), int(20+20*t), 255]
+                                    dpg.draw_circle(parent=dl,
+                                        center=(tx, _CY), radius=_sc(3),
+                                        color=[0,0,0,0], fill=c)
+                            else:
+                                bx = int(_CX + _R * math.cos(_BASE_A))
+                                by = int(_CY + _R * math.sin(_BASE_A))
+                                for deg in angles:
+                                    a = _BASE_A + math.radians(deg)
+                                    hx = int(_CX + _R * math.cos(a))
+                                    hy = int(_CY + _R * math.sin(a))
+                                    dpg.draw_line(parent=dl,
+                                        p1=(_CX, _CY), p2=(hx, hy),
+                                        color=_COL_LINE, thickness=1)
+                                    dpg.draw_circle(parent=dl,
+                                        center=(hx, hy), radius=_DR,
+                                        color=[0,0,0,0], fill=_COL_HRM)
+                                dpg.draw_line(parent=dl,
+                                    p1=(_CX, _CY), p2=(bx, by),
+                                    color=_COL_LINE, thickness=1)
+                                dpg.draw_circle(parent=dl,
+                                    center=(bx, by), radius=_DR,
+                                    color=[0,0,0,0], fill=_COL_MAIN)
+                            dpg.add_text(label, color=[210, 210, 210])
+                            dpg.add_text(desc,  color=[130, 130, 130])
+                            dpg.add_spacer(width=_sc(86))  # fill cell
+                dpg.add_spacer(height=_sc(6))
+
+            dpg.add_spacer(height=_sc(8))
+            # ---- Keyboard ----
+            dpg.add_text("Keyboard", color=[160, 200, 255])
+            dpg.add_separator()
+            dpg.add_spacer(height=_sc(3))
+            dpg.add_text("Alt + P     Pick color (eyedropper)",
+                         color=[180, 180, 180])
+            dpg.add_spacer(height=_sc(8))
+            # ---- Drop & Import ----
+            dpg.add_text("Drop & Import", color=[160, 200, 255])
+            dpg.add_separator()
+            dpg.add_spacer(height=_sc(3))
+            dpg.add_text(
+                "Drop a file onto this window or use "
+                "the Import button in the Palettes tab.\n\n"
+                "Supported formats:\n"
+                "  .ase  Adobe / Affinity swatches\n"
+                "  .aco  Adobe Color\n"
+                "  .gpl  GIMP Palette\n"
+                "  .swatches  Procreate\n"
+                "  .png .jpg .bmp .gif .webp .tiff",
+                color=[180, 180, 180], wrap=W - _sc(16),
+            )
+
+            dpg.add_spacer(height=_sc(12))
+            # ---- App Info ----
+            dpg.add_text("Color Tools v1.2", color=[220, 220, 255])
+            dpg.add_text("by Tommi Sormunen", color=[160, 160, 160])
+            dpg.add_spacer(height=_sc(4))
+            def _open_github(s, a, u):
+                try:
+                    os.startfile("https://github.com/sort0m/Color-tools")
+                except Exception:
+                    pass
+            dpg.add_button(
+                label="github.com/sort0m/Color-tools",
+                callback=_open_github,
+                width=W - _sc(16), height=THUMB_H,
+            )
+
         dpg.add_separator()
+
+        def _toggle_options(s, a, u):
+            visible = dpg.is_item_shown("options_panel")
+            dpg.configure_item("options_panel",  show=not visible)
+            dpg.configure_item("tab_area",        show=visible)
+            dpg.set_item_label("options_btn",
+                               "Close Info" if not visible else "Info")
+
+        _OPT_BW = (W - _sc(6)) // 2 + 1 - _sc(2)
         with dpg.group(horizontal=True):
-            dpg.add_checkbox(label="Always on Top", callback=toggle_on_top,
-                             default_value=app.always_on_top)
-            dpg.add_text("  Theme:")
-            dpg.add_combo(
-                THEME_NAMES, tag="theme_combo",
-                default_value=app.theme_name,
-                width=_sc(82), callback=set_theme,
+            dpg.add_checkbox(
+                label="Always on Top",
+                tag="always_on_top_chk",
+                callback=toggle_on_top,
+                default_value=app.always_on_top,
+            )
+            dpg.add_spacer(width=W - _OPT_BW - _sc(130))
+            dpg.add_button(
+                tag="options_btn",
+                label="Info",
+                width=_OPT_BW, height=THUMB_H,
+                callback=_toggle_options,
             )
 
     # ─────────────────────────────────────────────────────────────────────
@@ -3092,13 +3972,16 @@ try:
                 fill=[0, 0, 0, 0], color=[70, 70, 70, 180],
             )
             # Value indicator line
+            # FIX: compute ind_col once here; the same value is reused in the
+            # update path below, eliminating the duplicate branch per frame.
             ind_col = [30, 30, 30, 240] if app.theme_name == "Light" else [255, 255, 255, 240]
             indicator_id = dpg.draw_line(
                 parent=tag_dl,
                 p1=(0, y0 - 2), p2=(0, y1 + 2),
                 color=ind_col, thickness=2,
             )
-            cache = {'seg_ids': seg_ids, 'indicator_id': indicator_id, 'y0': y0, 'y1': y1}
+            cache = {'seg_ids': seg_ids, 'indicator_id': indicator_id,
+                     'y0': y0, 'y1': y1, 'ind_col': ind_col, 'last_theme': app.theme_name}
             _GRAD_ITEM_CACHE[gname] = cache
 
         # ── Update segment colours and indicator (no delete/recreate) ────
@@ -3107,23 +3990,31 @@ try:
         cy0          = cache['y0']
         cy1          = cache['y1']
 
-        for i, rid in enumerate(seg_ids):
-            t = (i + 0.5) / SEGS
-            r, g, b = _grad_color(gname, t, ctx)
-            dpg.configure_item(rid, fill=[r, g, b, 255])
+        # FIX: Only repaint the 48 gradient segments when the colour context has
+        # actually changed (different base colour). When only val changes (user
+        # drags the handle but the underlying colour is the same, e.g. typing in
+        # the numeric field), the gradient background stays identical — skip the
+        # 48 configure_item calls and only move the indicator line.
+        if cache.get('last_ctx') != ctx:
+            cache['last_ctx'] = ctx
+            for i, rid in enumerate(seg_ids):
+                t = (i + 0.5) / SEGS
+                r, g, b = _grad_color(gname, t, ctx)
+                dpg.configure_item(rid, fill=[r, g, b, 255])
 
         t_val   = max(0., min(1., (val - smin) / (smax - smin))) if smax > smin else 0.  # FIX: clamp
         tx      = int(t_val * (GRAD_W - 1))
-        ind_col = [30, 30, 30, 240] if app.theme_name == "Light" else [255, 255, 255, 240]
+        # FIX: reuse cached ind_col; only recompute when the theme has changed.
+        if cache['last_theme'] != app.theme_name:
+            cache['ind_col']    = [30, 30, 30, 240] if app.theme_name == "Light" else [255, 255, 255, 240]
+            cache['last_theme'] = app.theme_name
+        ind_col = cache['ind_col']
         dpg.configure_item(indicator_id,
                            p1=(tx, cy0 - 2), p2=(tx, cy1 + 2), color=ind_col)
 
-        dpg.set_value(f"slval_{gname}", f"{val:>4}")
+        dpg.set_value(f"slval_{gname}", val)
 
-    # _POINT defined once here, not inside update() to avoid recreation every frame.
-    class _POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-    _pt = _POINT()   # Single global instance — no allocation per frame
+    _pt = _wt.POINT()   # Single global instance — no allocation per frame
 
     def update():
         # -- Frame-level mouse state ──────────────────────────────────────
@@ -3132,17 +4023,33 @@ try:
         _lmb_rel     = dpg.is_mouse_button_released(0)
         _rmb_clicked = dpg.is_mouse_button_clicked(1)
 
+        # -- Keyboard: Pipette hotkey (Alt+P) via Windows API ───────────
+        # GetAsyncKeyState: VK_MENU=0x12 (Alt), VK_P=0x50
+        _alt = ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000
+        _p   = ctypes.windll.user32.GetAsyncKeyState(0x50) & 0x8000
+        if _alt and _p:
+            if not app.pipette_active and not app._pipette_hotkey_held:
+                start_pipette()
+            app._pipette_hotkey_held = True
+        else:
+            app._pipette_hotkey_held = False
+
         # -- Viewport size guard ──────────────────────────────────────────
-        # DPG/GLFW auto-scales the viewport on DPI change. Because the window
-        # is resizable=False and content is fixed-size, force dimensions back.
-        _vw = dpg.get_viewport_width()
-        _vh = dpg.get_viewport_height()
-        if _vw != app._cached_vp_w or _vh != app._cached_vp_h:
-            app._cached_vp_w = _vw
-            app._cached_vp_h = _vh
-            if _vw != _FIXED_VP_W or _vh != _FIXED_VP_H:
-                dpg.set_viewport_width(_FIXED_VP_W)
-                dpg.set_viewport_height(_FIXED_VP_H)
+        # With per-monitor DPI (level 2), GLFW may still try to resize the
+        # viewport on monitor change.  Force dimensions back to the fixed
+        # size so the window never zooms.
+        if app._vp_size_guard_skip > 0:
+            app._vp_size_guard_skip -= 1
+        elif not app._tb_dragging:
+            _vw = dpg.get_viewport_width()
+            _vh = dpg.get_viewport_height()
+            if _vw != app._cached_vp_w or _vh != app._cached_vp_h:
+                app._cached_vp_w = _vw
+                app._cached_vp_h = _vh
+                if _vw != app._fixed_vp_w or _vh != app._fixed_vp_h:
+                    dpg.set_viewport_width(app._fixed_vp_w)
+                    dpg.set_viewport_height(app._fixed_vp_h)
+                    app._vp_size_guard_skip = 5
 
         # -- Frame-delayed color picker sync ──────────────────────────
         # Count down the undo write-freeze counter
@@ -3192,6 +4099,7 @@ try:
             app._pending_pipette_color = None
             _force_update_color_picker(v)
             _sync_all_modes()
+            _update_wheel_contrast()
             add_to_history(v)
 
         # -- Flush deferred save requested by background threads ─────────
@@ -3199,11 +4107,38 @@ try:
             app._pending_save = False
             save_config()
 
+        # -- Deferred palette editor close (set by _close_edit callback) ──
+        # Rebuilding the panel inside a DPG button callback deletes the button
+        # while DPG still holds a reference to it — potential segfault.
+        # The flag is consumed here, safely between render frames.
+        if app._pending_close_edit:
+            app._pending_close_edit = False
+            _rebuild_pal_rows()
+            _refresh_pal_edit_panel()
+
+        # -- Flush image import preview rebuild requested by slider bg thread ─
+        if app._img_preview_dirty:
+            app._img_preview_dirty = False
+            _rebuild_image_import_preview()
+
         # -- Open image-import panel when background thread has loaded an image ─
         if app._pending_image_import is not None and not app._image_modal_open:
             pil = app._pending_image_import
             app._pending_image_import = None
+            _navigate_to_palettes()
             _open_image_import_panel(pil)
+
+        # -- Handle file dropped onto the window ──────────────────────────────
+        if app._pending_drop_path is not None:
+            _path = app._pending_drop_path
+            app._pending_drop_path = None
+            _import_from_path(_path)
+
+        if app._pending_drop_colors is not None:
+            _dc, _dfname = app._pending_drop_colors
+            app._pending_drop_colors = None
+            app._drop_preview_colors_pending = _dc
+            _open_drop_preview(_dc, _dfname)
 
         vsig = color_sig(app.current_color)
         # Cache viewport position: fetch only while dragging or every 30 frames.
@@ -3212,7 +4147,6 @@ try:
         if app._tb_dragging or _lmb_down:
             try:
                 app._last_viewport_pos = list(dpg.get_viewport_pos())
-                app._cached_vp_pos     = app._last_viewport_pos
             except Exception:
                 pass
         else:
@@ -3231,7 +4165,7 @@ try:
                 pip_color = list(app.pip_color)
         else:
             pip_color = None
-        _new_preview = pip_color if pip else list(vsig) + [255]
+        _new_preview = pip_color if pip else [*list(vsig), 255]
         if _new_preview != app._last_drawn_preview:
             dpg.set_value("preview", _new_preview)
             app._last_drawn_preview = _new_preview
@@ -3282,13 +4216,20 @@ try:
                     color=_col, thickness=_THICK_ICON)
 
         # -- Titlebar drag ────────────────────────────────────────────────
-        # GetCursorPos only when LMB is down to avoid a syscall on every idle frame.
-        lmb_dn_tb  = _lmb_down
-        lmb_clk_tb = _lmb_clicked
+        # Use Win32 GetAsyncKeyState for LMB — reliable even when the cursor
+        # is outside the GLFW window (DPG misses the release event when the
+        # viewport jumps at a DPI boundary).
+        _lmb_hw      = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+        _lmb_hw_clk  = _lmb_hw and not app._tb_lmb_prev  # rising edge
+        app._tb_lmb_prev = _lmb_hw
+        lmb_dn_tb  = _lmb_hw
+        lmb_clk_tb = _lmb_hw_clk
         mx_g = my_g = 0
         if lmb_dn_tb or lmb_clk_tb:
             ctypes.windll.user32.GetCursorPos(ctypes.byref(_pt))
             mx_g, my_g = _pt.x, _pt.y
+
+        # -- Custom titlebar buttons ───────────────────────────────────────
         if lmb_clk_tb and dpg.does_item_exist("titlebar_cw"):
             vx, vy = dpg.get_viewport_pos()
             _rel_y = my_g - vy
@@ -3304,17 +4245,26 @@ try:
                 app._tb_dragging = True
                 app._tb_drag_start_vp = (mx_g - vx, my_g - vy)
         if not lmb_dn_tb:
+            if app._tb_dragging:
+                app._vp_size_guard_skip = 5
             app._tb_dragging = False
         if app._tb_dragging and lmb_dn_tb:
             ox, oy = app._tb_drag_start_vp
-            dpg.set_viewport_pos([mx_g - ox, my_g - oy])
+            new_vx = mx_g - ox
+            new_vy = my_g - oy
+            _tb_hwnd = _get_own_hwnd() if not app._tb_hwnd_cache else app._tb_hwnd_cache
+            if _tb_hwnd:
+                app._tb_hwnd_cache = _tb_hwnd
+                ctypes.windll.user32.MoveWindow(
+                    _tb_hwnd, new_vx, new_vy,
+                    app._fixed_vp_w, app._fixed_vp_h, False)
 
         # -- Sliders ──────────────────────────────────────────────────────
         # Always reset wheel delta regardless of mode. Without this, delta
         # accumulates in wheel mode and fires a jump when switching to sliders.
         wheel_delta            = app._mouse_wheel_delta
         app._mouse_wheel_delta = 0
-        if not app.use_wheel:
+        if not app.use_wheel and app.top_tab == "sliders":
             smode    = app.slider_mode
             current  = SLIDERS_BY_MODE.get(smode, [])
             # Compute _grad_ctx() once before the loop, not once per slider.
@@ -3338,6 +4288,7 @@ try:
                     app.sl_vals[gname] = int(round(smin + (smax - smin) * t))
                     _apply_from_mode(smode)
                     _update_selected_pal_color()
+                    _update_wheel_contrast()
                 # Mouse wheel: delta > 0 = up (increase), < 0 = down (decrease)
                 if hovered and wheel_delta != 0 and not _lmb_down:
                     step = max(1, (smax - smin) // 50)
@@ -3345,6 +4296,7 @@ try:
                     app.sl_vals[gname] = max(smin, min(smax, new_val))
                     _apply_from_mode(smode)
                     _update_selected_pal_color()
+                    _update_wheel_contrast()
                 if (app._last_sl_vals.get(gname) != app.sl_vals.get(gname)
                         or app._last_sl_vals.get('_sig') != vsig):
                     _draw_grad_slider(gname, smin, smax, _frame_grad_ctx)
@@ -3359,14 +4311,7 @@ try:
 
             updates = [("main", rf, gf, bf)]
 
-            angles = {
-                "Complementary":       [180],
-                "Split Complementary": [150, 210],
-                "Analogous":           [30, -30],
-                "Triadic":             [120, 240],
-                "Tetradic":            [90, 180, 270],
-                "Rectangle":           [60, 180, 240],
-            }.get(mode, [])
+            angles = _HARMONY_ANGLES.get(mode, [])
 
             if mode in ["Tints", "Shades", "Tones"]:
                 if mode == "Tints":
@@ -3405,8 +4350,6 @@ try:
                 app._harmony_text_dirty = True  # defer text/WCAG update
 
             app.harmony_rgb = {}
-            is_contrast = (fmt == "Contrast")
-            show_copy   = not is_contrast and mode not in ("Tints", "Shades", "Tones")
 
             for i, tag in enumerate(HARMONY_TAGS):
                 keys = HARMONY_KEYS[tag]
@@ -3414,30 +4357,15 @@ try:
                     rgb2 = tuple(to_int(c) for c in updates[i][1:])
                     app.harmony_rgb[tag] = rgb2
                     # Fast update: always — colour swatch reflects colour in real time
-                    dpg.set_value(keys["rect"], list(rgb2) + [255])
+                    dpg.set_value(keys["rect"], [*list(rgb2), 255])
                     if _do_full_update:
-                        # Slow update: visibility, text, WCAG, layout
+                        # Slow update: visibility, text, layout
                         dpg.configure_item(keys["group"],    show=True)
-                        dpg.configure_item(keys["val"],      show=not is_contrast)
-                        dpg.configure_item(keys["ctr_grp"],  show=is_contrast)
-                        dpg.configure_item(keys["ctr_bars"], show=is_contrast)
-                        dpg.configure_item(keys["copy_btn"], show=show_copy)
-                        if is_contrast:
-                            r2, g2, b2 = rgb2
-                            cw = contrast_ratio(r2, g2, b2, 255, 255, 255)
-                            cb = contrast_ratio(r2, g2, b2, 0,   0,   0  )
-                            dpg.set_value(keys["ctr_w"],
-                                          f"W  {cw:.2f}:1  {wcag_level(cw)}")
-                            dpg.configure_item(keys["ctr_w"], color=wcag_color(cw))
-                            dpg.set_value(keys["ctr_b"],
-                                          f"B  {cb:.2f}:1  {wcag_level(cb)}")
-                            dpg.configure_item(keys["ctr_b"], color=wcag_color(cb))
-                            if dpg.does_item_exist(keys["ctr_bar_w"]):
-                                dpg.configure_item(keys["ctr_bar_w"], color=[r2, g2, b2, 255])
-                            if dpg.does_item_exist(keys["ctr_bar_b"]):
-                                dpg.configure_item(keys["ctr_bar_b"], color=[r2, g2, b2, 255])
-                        else:
-                            dpg.set_value(keys["val"], format_value(tag, fmt))
+                        dpg.configure_item(keys["val"],      show=True)
+                        dpg.configure_item(keys["ctr_grp"],  show=False)
+                        dpg.configure_item(keys["ctr_bars"], show=False)
+                        dpg.configure_item(keys["copy_btn"], show=True)
+                        dpg.set_value(keys["val"], format_value(tag, fmt))
                 else:
                     if _do_full_update:
                         dpg.configure_item(keys["group"], show=False)
@@ -3455,6 +4383,15 @@ try:
         ):
             app._harmony_text_dirty = False
             refresh_harmony_values()
+
+        # -- Cancel palette-select mode if history shifted under it ──────────
+        # add_to_history() sets this flag (inside its lock) when appendleft would
+        # desync the stored indices from the displayed swatches. _exit_palette_select_mode
+        # is safe to call here — we are on the main thread, outside any lock.
+        if app._palette_select_cancel_pending:
+            app._palette_select_cancel_pending = False
+            if app.palette_select_mode:
+                _exit_palette_select_mode()
 
         # -- History ──────────────────────────────────────────────────────
         if app._hist_dirty:
@@ -3523,7 +4460,14 @@ try:
             if vsig != app._last_edit_color_sig:
                 app._last_edit_color_sig = vsig
                 if not app._pal_drag_active:
-                    _refresh_pal_edit_panel()
+                    # FIX: fast-path — update only the one changed swatch rectangle
+                    # instead of tearing down and rebuilding the entire panel.
+                    # _update_active_pal_swatch returns False if the drawlist is
+                    # stale (e.g. panel was rebuilt for another reason), in which
+                    # case we fall back to a full refresh.
+                    _r, _g, _b = vsig
+                    if not _update_active_pal_swatch(app._pal_selected_idx, _r, _g, _b):
+                        _refresh_pal_edit_panel()
 
         # Palette rebuild: _pal_dirty is set by the main thread and background threads.
         if app._pal_dirty:
@@ -3536,11 +4480,11 @@ try:
     dpg.create_viewport(
         title='Color Tools',
         width=int(283*_DPI_SCALE),
-        height=int(623*_DPI_SCALE),   # same total height as original; custom bar replaces native
+        height=int(617*_DPI_SCALE),
         x_pos=_start_pos[0], y_pos=_start_pos[1],
         resizable=False,
-        decorated=False,   # hide native Windows title bar; custom bar is used instead
-        vsync=False,       # manual FPS limiter handles frame pacing
+        decorated=False,
+        vsync=False,
     )
     dpg.setup_dearpygui()
     dpg.bind_theme(_dark_theme)
@@ -3564,17 +4508,16 @@ try:
                 color=[0, 0, 0, 0],
             )
 
-    dpg.show_viewport()
+    # Render initial frames, then show viewport.
     dpg.set_primary_window("PrimaryWindow", True)
-    # Restore always-on-top state from config before the first frame.
     if app.always_on_top:
         dpg.set_viewport_always_top(True)
-    dpg.render_dearpygui_frame()
+    app._fixed_vp_w = dpg.get_viewport_width()
+    app._fixed_vp_h = dpg.get_viewport_height() + 47  # DPG under-reports height by ~47 px in undecorated mode on Windows; empirically determined offset
+    dpg.set_viewport_width(app._fixed_vp_w)
+    dpg.set_viewport_height(app._fixed_vp_h)
+    dpg.show_viewport()
 
-    # Record the desired viewport size after the first frame. If DPG or Windows
-    # resizes it later (e.g. DPI change), restore this size every frame.
-    _FIXED_VP_W = dpg.get_viewport_width()
-    _FIXED_VP_H = dpg.get_viewport_height()
 
     # Set titlebar spacer once — resizable=False so viewport width never changes.
     if dpg.does_item_exist("tb_spacer"):
@@ -3587,6 +4530,7 @@ try:
     set_theme(None, app.theme_name)
 
     _sync_all_modes()
+    _update_wheel_contrast()
     _rebuild_pal_rows()
 
     # Apply Win32 DWM dark titlebar style. Wait until the HWND is available.
@@ -3594,6 +4538,16 @@ try:
         _hwnd = _get_own_hwnd()
         if _hwnd:
             try:
+                # FIX: argtypes must be set before the call. Without them ctypes
+                # defaults all args to c_int (32-bit), silently truncating the
+                # 64-bit HWND on 64-bit Windows → ERROR_INVALID_HANDLE, no dark bar.
+                ctypes.windll.dwmapi.DwmSetWindowAttribute.restype  = ctypes.c_long
+                ctypes.windll.dwmapi.DwmSetWindowAttribute.argtypes = [
+                    ctypes.c_void_p,   # hwnd
+                    ctypes.c_ulong,    # dwAttribute
+                    ctypes.c_void_p,   # pvAttribute
+                    ctypes.c_ulong,    # cbAttribute
+                ]
                 _dark = ctypes.c_int(1)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     _hwnd, 20, ctypes.byref(_dark), ctypes.sizeof(_dark)
@@ -3602,6 +4556,83 @@ try:
                 pass
             break
         time.sleep(0.05)
+
+    # Enable file drag-and-drop onto the window using Win32 WndProc subclassing.
+    # When a file is dropped, WM_DROPFILES is posted; the subclassed proc stores
+    # the path in app._pending_drop_path and update() dispatches it.
+    _WM_DROPFILES = 0x0233
+    _GWLP_WNDPROC = -4
+    _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        ctypes.c_void_p, ctypes.c_uint,
+        ctypes.c_size_t,  ctypes.c_ssize_t,
+    )
+    # Keep a list so the references survive the whole run.
+    _wndproc_refs = []
+
+    if _hwnd:
+        try:
+            _user32  = ctypes.windll.user32
+            _shell32 = ctypes.windll.shell32
+
+            # Allow WM_DROPFILES through UIPI message filter (needed when UAC is active).
+            # MSGFLT_ALLOW = 1; WM_COPYGLOBALDATA (0x0049) is also required on some systems.
+            try:
+                _user32.ChangeWindowMessageFilterEx(_hwnd, _WM_DROPFILES, 1, None)
+                _user32.ChangeWindowMessageFilterEx(_hwnd, 0x0049, 1, None)
+            except Exception:
+                pass
+
+            _shell32.DragAcceptFiles(_hwnd, True)
+            _shell32.DragQueryFileW.restype  = ctypes.c_uint
+            _shell32.DragQueryFileW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_wchar_p, ctypes.c_uint,
+            ]
+            _shell32.DragFinish.restype  = None
+            _shell32.DragFinish.argtypes = [ctypes.c_void_p]
+
+            # GetWindowLongPtrW / SetWindowLongPtrW do not exist in 32-bit user32.dll;
+            # fall back to the 32-bit variants so the app works under a 32-bit interpreter.
+            if hasattr(_user32, 'GetWindowLongPtrW'):
+                _GetWindowLongPtr = _user32.GetWindowLongPtrW
+                _SetWindowLongPtr = _user32.SetWindowLongPtrW
+            else:
+                _GetWindowLongPtr = _user32.GetWindowLongW
+                _SetWindowLongPtr = _user32.SetWindowLongW
+            _GetWindowLongPtr.restype  = ctypes.c_ssize_t
+            _GetWindowLongPtr.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            _SetWindowLongPtr.restype  = ctypes.c_ssize_t
+            _SetWindowLongPtr.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            _user32.CallWindowProcW.restype    = ctypes.c_ssize_t
+            _user32.CallWindowProcW.argtypes   = [
+                ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_size_t, ctypes.c_ssize_t,
+            ]
+
+            _old_wndproc_ptr = _GetWindowLongPtr(_hwnd, _GWLP_WNDPROC)
+
+            def _drop_wndproc(hwnd_w, msg, wp, lp):
+                if msg == _WM_DROPFILES:
+                    try:
+                        _buf = ctypes.create_unicode_buffer(260)
+                        _shell32.DragQueryFileW(wp, 0, _buf, 260)
+                        _dpath = _buf.value
+                        _shell32.DragFinish(wp)
+                        if _dpath:
+                            app._pending_drop_path = _dpath
+                    except Exception:
+                        pass
+                    return 0
+                return _user32.CallWindowProcW(_old_wndproc_ptr, hwnd_w, msg, wp, lp)
+
+            _new_proc = _WNDPROC_TYPE(_drop_wndproc)
+            _wndproc_refs.append(_new_proc)
+            # Cast to integer address — SetWindowLongPtrW won't accept a WINFUNCTYPE directly.
+            _new_proc_addr = ctypes.cast(_new_proc, ctypes.c_void_p).value
+            _SetWindowLongPtr(_hwnd, _GWLP_WNDPROC, _new_proc_addr)
+        except Exception:
+            _write_log("drop wndproc setup failed:\n" + traceback.format_exc())
 
     # Set Windows timer resolution to 1 ms (default ~15.6 ms) for smooth
     # FPS throttling and accurate sleep.
@@ -3633,16 +4664,14 @@ try:
     if _pip_tid_shutdown:
         try:
             ctypes.windll.user32.PostThreadMessageW(_pip_tid_shutdown, 0x0012, 0, 0)
-        except Exception:
-            pass
+        except Exception: pass
 
     # Close the Win32 eyedropper overlay
     if _pip_hwnd[0]:
         try:
             _pip_u32.DestroyWindow(_pip_hwnd[0])
             _pip_u32.UnregisterClassW(_pip_cls[0], _pip_hInst)
-        except Exception:
-            pass
+        except Exception: pass
         _pip_hwnd[0] = None
     # Free eyedropper GDI resources
     try:
@@ -3658,8 +4687,7 @@ try:
     if _timer_period_set:
         try:
             ctypes.windll.winmm.timeEndPeriod(1)
-        except Exception:
-            pass
+        except Exception: pass
 
     dpg.destroy_context()
 
