@@ -4,7 +4,7 @@ A compact color picker, color theory guide and palette manager for Windows. Pick
 
 ## Download and run
 
-The Windows executable will be available in this repository's **Releases** section once published. Close any older running version, then launch **ColorTools.exe**. No separate Python installation is needed.
+The Windows executable is available in this repository's Releases section. Close any older running version, then launch **ColorTools.exe**. No separate Python installation is needed.
 
 Built for Windows x64. The application does not run on Linux or macOS.
 
