@@ -1,8 +1,2 @@
-# Color Tools — Python dependencies
-# Install with: pip install -r requirements.txt
-
-dearpygui>=2.0.0
-pyperclip>=1.8.0
-
-# Optional — required only for image palette import
-Pillow>=10.0.0
+dearpygui==2.2
+Pillow==12.3.0
