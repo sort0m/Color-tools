@@ -10,11 +10,11 @@ Built for Windows x64. The application does not run on Linux or macOS.
 
 ## Screenshots
 
-![Harmony tab](screenshots/ct1.jpg)
-
-![History tab](screenshots/ct2.jpg)
-
-![Palettes tab](screenshots/ct3.jpg)
+<p>
+  <img src="screenshots/ct1.jpg" alt="Harmony tab" width="32%">
+  <img src="screenshots/ct2.jpg" alt="History tab" width="32%">
+  <img src="screenshots/ct3.jpg" alt="Palettes tab" width="32%">
+</p>
 
 ## Features
 
