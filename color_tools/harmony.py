@@ -10,6 +10,7 @@ import re
 import time as _time
 
 import dearpygui.dearpygui as dpg
+from .accessibility import contrast_color
 
 from .color_math import (
     contrast_ratio, wcag_level, wcag_color, nearest_css,
@@ -49,6 +50,7 @@ def format_value(tag, fmt):
     return format_color(rgb, fmt) if rgb is not None else ""
 
 def refresh_harmony_values():
+    from .fonts import bind_value_font
     fmt = app.fmt_mode
     for tag in HARMONY_TAGS:
         keys = HARMONY_KEYS[tag]
@@ -59,6 +61,7 @@ def refresh_harmony_values():
         dpg.configure_item(keys["val"],      show=True)
         dpg.configure_item(keys["copy_btn"], show=True)
         dpg.set_value(f"val_{tag}", format_value(tag, fmt))
+        bind_value_font(keys["val"])
 
 # ── WCAG-kontrastin päivitys ──────────────────────────────────────────────────
 _wc_themes_created = [False]
@@ -90,9 +93,9 @@ def _update_wheel_contrast():
     cb = contrast_ratio(r, g, b, 0,   0,   0)
     cc = contrast_ratio(r, g, b, *custom_bg)
 
-    cw_color = list(wcag_color(cw)) + [255]
-    cb_color = list(wcag_color(cb)) + [255]
-    cc_color = list(wcag_color(cc)) + [255]
+    cw_color = contrast_color(wcag_color(cw), [[0, 0, 0]])
+    cb_color = contrast_color(wcag_color(cb), [[0, 0, 0]])
+    cc_color = contrast_color(wcag_color(cc), [[0, 0, 0]])
 
     # W/B/C -napit päivitetään
     _w_lbl = t("wcag_w")[0]   # "W" tai "V"
@@ -178,8 +181,6 @@ def add_to_history(color):
 # ── Palette-edit värin päivitys ───────────────────────────────────────────────
 def _update_selected_pal_color():
     from .state import _palettes_lock
-    if app._pal_undo_freeze > 0:
-        return
     if app._editing_pal and app._pal_selected_idx is not None:
         with _palettes_lock:
             if app._editing_pal in app.palettes:
@@ -190,9 +191,11 @@ def _update_selected_pal_color():
                         snap = app._pal_pre_edit_snapshot
                         if snap is not None:
                             nm = app._editing_pal
-                            app._pal_undo_stack.append((nm, snap))
+                            from .palette_history import record_snapshot
+                            record_snapshot(app._pal_undo_stack, nm, snap)
                             if dpg.does_item_exist("pal_undo_btn"):
-                                dpg.configure_item("pal_undo_btn", enabled=True)
+                                dpg.configure_item("pal_undo_btn", enabled=any(
+                                    entry[0] == nm for entry in app._pal_undo_stack))
                         app._pal_edit_dirty = True
                         app._pal_pre_edit_snapshot = None
                     colors[app._pal_selected_idx] = [r, g, b, 255]

@@ -3,6 +3,7 @@ eyedropper.py — Pipetti (eyedropper), Win32-overlay-ikkuna, GDI-piirto.
 """
 
 import ctypes
+import os
 import ctypes.wintypes as _wt
 import threading
 import time as _time
@@ -10,6 +11,7 @@ import time as _time
 
 from .bootstrap import _sc, _DPI_SCALE, _write_log
 from .state import app, _pip_lock
+from .fonts import HEX_FONT_SIZE
 
 # ── Message-pumping sleep ─────────────────────────────────────────────────────
 _mwfmo_user32 = ctypes.windll.user32
@@ -75,6 +77,9 @@ def _pipette_run():
     _user32  = ctypes.windll.user32
     _kernel32 = ctypes.windll.kernel32
     _tid     = _kernel32.GetCurrentThreadId()
+    # Create the message queue before publishing the id or starting capture.
+    _queue_msg = _wt.MSG()
+    _user32.PeekMessageW(ctypes.byref(_queue_msg), None, 0, 0, 0)
     app._pipette_thread_tid = _tid
     _hook_id = [None]
 
@@ -383,6 +388,13 @@ _pip_g32.SelectObject.restype           = ctypes.c_void_p
 _pip_g32.SelectObject.argtypes          = [ctypes.c_void_p, ctypes.c_void_p]
 _pip_g32.DeleteObject.restype           = ctypes.c_bool
 _pip_g32.DeleteObject.argtypes          = [ctypes.c_void_p]
+_pip_g32.AddFontResourceExW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+_pip_g32.AddFontResourceExW.restype = ctypes.c_int
+_pip_g32.RemoveFontResourceExW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+_pip_g32.RemoveFontResourceExW.restype = ctypes.c_bool
+_pip_g32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint] * 8 + [ctypes.c_wchar_p]
+_pip_g32.CreateFontW.restype = ctypes.c_void_p
+_pip_font_path = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'consola.ttf')
 _pip_g32.DeleteDC.restype               = ctypes.c_bool
 _pip_g32.DeleteDC.argtypes              = [ctypes.c_void_p]
 _pip_g32.SetBkMode.restype              = ctypes.c_int
@@ -419,11 +431,24 @@ def _pip_init_gdi():
         _pip_gdi['hbmp']       = hbmp
         _pip_gdi['old_hbmp']   = _old_hbmp
         _pip_gdi['bits_ptr']   = bits_ptr
+        # Load the Windows Consolas font privately for the native HEX overlay.
+        if _pip_g32.AddFontResourceExW(_pip_font_path, 0x10, None):
+            _pip_gdi['font_resource'] = True
+        font = _pip_g32.CreateFontW(-_sc(HEX_FONT_SIZE), 0, 0, 0, 400,
+                                  0, 0, 0, 1, 0, 0, 4, 0, "Consolas")
+        if font:
+            _pip_gdi['font'] = font
+            _pip_gdi['old_font'] = _pip_g32.SelectObject(hdc_mem, font)
     else:
         _pip_g32.DeleteDC(hdc_mem)
         _pip_u32.ReleaseDC(None, hdc_screen)
 
 def _pip_free_gdi():
+    if _pip_gdi.get('font'):
+        _pip_g32.SelectObject(_pip_gdi['hdc_mem'], _pip_gdi['old_font'])
+        _pip_g32.DeleteObject(_pip_gdi['font'])
+    if _pip_gdi.get('font_resource'):
+        _pip_g32.RemoveFontResourceExW(_pip_font_path, 0x10, None)
     if _pip_gdi['hdc_mem'] and _pip_gdi.get('old_hbmp'):
         _pip_g32.SelectObject(_pip_gdi['hdc_mem'], _pip_gdi['old_hbmp'])
     if _pip_gdi['hbmp']:
@@ -441,6 +466,14 @@ _pip_sw_row_bytes = ctypes.sizeof(_pip_sw_row)
 _PIP_TEXT_W = _PIP_OW - _PIP_SW
 _pip_txt_row = (ctypes.c_uint32 * _PIP_TEXT_W)()
 _pip_txt_row_bytes = ctypes.sizeof(_pip_txt_row)
+
+# Grayscale glyph coverage composited over the translucent background.
+# UpdateLayeredWindow requires premultiplied RGB, including antialiased edges.
+_pip_text_pixels = tuple(
+    ((coverage + (_PIP_BG_A * (255 - coverage) + 127) // 255) << 24)
+    | ((coverage + ((_PIP_BG_VAL & 255) * (255 - coverage) + 127) // 255) * 0x010101)
+    for coverage in range(256)
+)
 
 def _pip_draw(ox, oy, pr, pg, pb):
     """Piirtää eyedropper-overlayn UpdateLayeredWindow:lla."""
@@ -470,17 +503,15 @@ def _pip_draw(ox, oy, pr, pg, pb):
     _pip_g32.SetTextColor(hdc_mem, 0xFFFFFF)
     rc3 = _wt.RECT(_PIP_SW, 0, _PIP_OW - 2, _PIP_OH)
     _pip_u32.DrawTextW(hdc_mem, hex_str, -1, ctypes.byref(rc3), 0x0025)
+    # Finish batched GDI writes before reading/modifying DIB memory directly.
+    _pip_g32.GdiFlush()
 
-    _bg  = _PIP_BG_VAL
     _txt_x_off = _PIP_SW * 4
     for _ty in range(_PIP_OH):
         src = bits_ptr.value + _ty * _row_stride + _txt_x_off
         ctypes.memmove(_pip_txt_row, src, _pip_txt_row_bytes)
         for _k in range(_PIP_TEXT_W):
-            if (_pip_txt_row[_k] & 0xFF) > 40:
-                _pip_txt_row[_k] = 0xFFFFFFFF
-            else:
-                _pip_txt_row[_k] = _bg
+            _pip_txt_row[_k] = _pip_text_pixels[_pip_txt_row[_k] & 0xFF]
         ctypes.memmove(src, _pip_txt_row, _pip_txt_row_bytes)
 
     pt_dst = _wt.POINT(ox, oy)
@@ -518,8 +549,6 @@ _pip_u32.DestroyWindow.restype   = ctypes.c_bool
 _pip_u32.DestroyWindow.argtypes  = [ctypes.c_void_p]
 _pip_u32.UnregisterClassW.restype  = ctypes.c_bool
 _pip_u32.UnregisterClassW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
-_pip_u32.PostQuitMessage.restype   = None
-_pip_u32.PostQuitMessage.argtypes  = [ctypes.c_int]
 
 _pip_was_visible  = [False]
 _PIP_HWND_TOPMOST = ctypes.c_void_p(-1)
@@ -557,44 +586,83 @@ def _pip_overlay_update():
         _pip_u32.ShowWindow(_pip_hwnd[0], 0)
 
 
-# ── Globaali pikanäppäin Alt+P (RegisterHotKey) ──────────────────────────────
-_hotkey_tid = [0]
-_hotkey_ok  = [False]
+# ── Configurable global shortcut ────────────────────────────────────────────
+from .hotkey_config import MODIFIERS, KEYS, clean_hotkey
 
-def _hotkey_thread(ready, result):
+_hotkey_tid = [0]
+_hotkey_ok = [False]
+_hotkey_worker = None
+_hotkey_cancel = threading.Event()
+
+
+def _hotkey_thread(ready, result, settings):
     u32 = ctypes.windll.user32
-    MOD_ALT, MOD_NOREPEAT, VK_P, WM_HOTKEY = 0x0001, 0x4000, 0x50, 0x0312
-    _hotkey_tid[0] = ctypes.windll.kernel32.GetCurrentThreadId()
-    ok = bool(u32.RegisterHotKey(None, 1, MOD_ALT | MOD_NOREPEAT, VK_P))
-    _hotkey_ok[0] = ok
-    result[0] = ok
-    ready.set()
-    if not ok:
-        _write_log("RegisterHotKey(Alt+P) failed - falling back to key polling.")
-        _hotkey_tid[0] = 0
-        return
     msg = _wt.MSG()
+    u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+    _hotkey_tid[0] = ctypes.windll.kernel32.GetCurrentThreadId()
+    ok = False
     try:
+        ok = bool(u32.RegisterHotKey(None, 1, MODIFIERS[settings['modifiers']] | 0x4000,
+                                    KEYS[settings['key']]))
+        _hotkey_ok[0] = result[0] = ok
+        ready.set()
+        if not ok or _hotkey_cancel.is_set():
+            return
         while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY:
+            if _hotkey_cancel.is_set():
+                break
+            if msg.message == 0x0312:
                 start_pipette()
     finally:
-        u32.UnregisterHotKey(None, 1)
+        if ok:
+            u32.UnregisterHotKey(None, 1)
         _hotkey_ok[0] = False
         _hotkey_tid[0] = 0
+        ready.set()
 
-def start_hotkey():
-    """Rekisteröi Alt+P. Palauttaa True jos onnistui (muuten käytetään pollausta)."""
-    ready  = threading.Event()
-    result = [False]
-    threading.Thread(target=_hotkey_thread, args=(ready, result), daemon=True).start()
-    ready.wait(1.0)
+
+def start_hotkey(settings=None):
+    """Register the chosen shortcut; occupied combinations stay inactive."""
+    global _hotkey_worker
+    settings = dict(app.pipette_hotkey if settings is None else settings)
+    if _hotkey_worker is not None and _hotkey_worker.is_alive():
+        return _hotkey_ok[0]
+    if not settings['enabled']:
+        return True
+    ready, result = threading.Event(), [False]
+    _hotkey_cancel.clear()
+    _hotkey_worker = threading.Thread(target=_hotkey_thread, args=(ready, result, settings), daemon=True)
+    _hotkey_worker.start()
+    if not ready.wait(1.0):
+        stop_hotkey()
+        return False
     return result[0]
 
+
 def stop_hotkey():
+    """Wait for unregistration before allowing a replacement worker."""
+    _hotkey_cancel.set()
     tid = _hotkey_tid[0]
     if tid:
         ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)
+    if _hotkey_worker is not None:
+        _hotkey_worker.join(timeout=1.0)
+        return not _hotkey_worker.is_alive()
+    return True
 
-def hotkey_registered():
-    return _hotkey_ok[0]
+
+def change_hotkey(settings):
+    """Apply immediately, restoring the previous binding on failure."""
+    settings = clean_hotkey(settings)
+    old = dict(app.pipette_hotkey)
+    if not stop_hotkey():
+        app._hotkey_notice = 'hotkey_unavailable'
+        return False
+    if start_hotkey(settings):
+        app.pipette_hotkey = settings
+        app._hotkey_notice = 'hotkey_saved'
+        return True
+    stop_hotkey()
+    restored = start_hotkey(old)
+    app._hotkey_notice = 'hotkey_conflict' if restored else 'hotkey_unavailable'
+    return False

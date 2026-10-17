@@ -3,7 +3,7 @@ i18n.py - Käännökset suomeksi ja englanniksi.
 
 Käyttö:
     from .i18n import t
-    label = t("harmony_tab")
+    label = t("tab_harmony")
 """
 
 from . import __version__
@@ -12,18 +12,23 @@ from .state import app
 # ── Käännössanakirjat ─────────────────────────────────────────────────────────
 _TRANSLATIONS = {
     "en": {
+        'hotkey_enabled': 'Enable shortcut',
+        'hotkey_apply': 'Apply',
+        'hotkey_reset': 'Reset',
+        'hotkey_saved': 'Shortcut saved.',
+        'hotkey_conflict': 'Shortcut unavailable. Previous setting restored.',
+        'hotkey_unavailable': 'Shortcut unavailable. Choose another combination; the Pick Color button still works.',
+
+        "imp_aco_skipped": "Warning: {n} colors were skipped because their color spaces are not supported. The other colors can be imported.",
+        "imp_aco_none": "No colors were imported: all {n} colors use unsupported color spaces.",
         'pal_editor_page': 'Page {page}/{pages}',
-        'pal_editor_range': 'Colors {first}–{last} / {n}',
-        'pal_move_to': 'Move to position…',
-        'pal_move_position': 'New position (starting at 1):',
-        'pal_move': 'Move',
-        'pal_move_range': 'Enter a number between 1 and {n}.',
-        'pal_summary': '{name} ({n} colors)',
         'imp_busy': 'Finish the current import or file dialog first.',
         'export_failed': 'Export failed. The previous file was preserved. See error.log for details.',
+        'export_open_failed': 'File saved, but the browser could not be opened. Open the HTML file manually.',
+        'export_aco_limit': 'ACO supports at most 65,535 colors. Choose another export format.',
         'export_saved': 'File saved.',
         'config_blocked': 'Settings could not be read or backed up safely. Saving is disabled for this session. Your existing config.json is preserved.',
-        'config_recovered': 'Damaged settings were backed up beside config.json. Defaults are being used.',
+        'config_recovered': 'Damaged settings were backed up beside config.json. Readable settings were kept; invalid data was skipped or reset.',
         'config_save_failed': 'Settings could not be saved. Your previous settings file is preserved. Check disk space and directory permissions.',
         'pal_color_limit': 'This palette already contains the maximum of 1000 colors.',
         # Tabs
@@ -38,7 +43,7 @@ _TRANSLATIONS = {
         "tab_simulation": "Simulation",
 
         # Buttons
-        "pick_color":     "Pick Color (Alt + P)",
+        "pick_color":     "Pick Color",
         "export_html":    "Export HTML",
         "save_palette":   "Save Palette",
         "new_palette":    "New Palette",
@@ -81,7 +86,7 @@ _TRANSLATIONS = {
             "Export          Save palette to file"
         ),
         "info_keyboard":         "Keyboard",
-        "info_keyboard_help":    "Alt + P     Pick color (eyedropper)",
+        "info_keyboard_help":    "The shortcut works in all applications and reserves the selected combination. Alt is required. Esc cancels picking.",
         "info_drop":             "Drop & Import",
         "info_drop_help":        (
             "Drop a file onto this window or use "
@@ -103,7 +108,7 @@ _TRANSLATIONS = {
         "delete_btn":            "Delete",
         "export_format":         "Select format:",
         "drop_import_label":     "Import this palette?",
-        "img_how_many":          "How many colors?  (2-20)",
+        "img_how_many":          "How many colors?  (2-30)",
         "img_preview":           "Preview:",
         "img_ok":                "OK",
         "pal_limit":            "Palette limit reached ({n}).",
@@ -138,16 +143,12 @@ _TRANSLATIONS = {
     "dlg_filter_images":    "Image files",
     "dlg_filter_all_files": "All files",
     "dlg_html_file":        "HTML file",
-    "imp_invalid":          "Not a valid {fmt} file.",
-    "imp_none":             "No colours found in {fmt} file.",
-    "imp_aco_version":      "Unsupported ACO version {n}.",
+    "imp_none":             "No colors found in {fmt} file.",
     "imp_unsupported":      "Unsupported file type: {ext}",
     "imp_no_pillow":        "Pillow 12.3.0 or newer is required. Run: pip install -r requirements.txt",
-    "imp_img_open":         "Could not open image - see error.log",
     "imp_failed":           "Import failed - see error.log",
     "imp_too_large":        "File is too large.",
-    "imp_img_too_large":    "Image is too large ({w} × {h} px).",
-    "imp_capped":           "Only the first {n} colours imported.",
+    "imp_capped":           "Only the first {n} colors imported.",
     "wcag_level_fail":      "Fail",
     "html_lang":            "en",
     "html_th_preview":      "Preview",
@@ -156,26 +157,31 @@ _TRANSLATIONS = {
     "html_th_theory":       "Theory",
     "html_copy":            "Copy",
     "html_copied":          "Copied!",
-    "theory_header":        "Selected colour: {name} ({hex})",
+    "theory_header":        "Selected color: {name} ({hex})",
     "theory_association_title": "Association:",
     "theory_body":          ("{reason}\n\nHistory:\n{history}\n\n"
-                             "Visual tone:\n{mood}, {saturation}. This colour reads as {tone} overall.\n\n"
-                             "Colour temperature:\n{temperature}\n\nIn a UI:\n{ui_role}"),
+                             "Visual tone:\n{mood}, {saturation}. This color reads as {tone} overall.\n\n"
+                             "Color temperature:\n{temperature}\n\nIn a UI:\n{ui_role}"),
     },
 
     "fi": {
+        'hotkey_enabled': 'Pikanäppäin käytössä',
+        'hotkey_apply': 'Käytä',
+        'hotkey_reset': 'Palauta',
+        'hotkey_saved': 'Pikanäppäin tallennettu.',
+        'hotkey_conflict': 'Pikanäppäin ei ole saatavilla. Aiempi asetus palautettiin.',
+        'hotkey_unavailable': 'Pikanäppäin ei ole saatavilla. Valitse toinen yhdistelmä; Valitse väri -painike toimii edelleen.',
+
+        "imp_aco_skipped": "Varoitus: {n} väriä ohitettiin, koska niiden väriavaruutta ei tueta. Muut värit voidaan tuoda.",
+        "imp_aco_none": "Värejä ei tuotu: kaikkien {n} värin väriavaruus on tuen ulkopuolella.",
         'pal_editor_page': 'Sivu {page}/{pages}',
-        'pal_editor_range': 'Värit {first}–{last} / {n}',
-        'pal_move_to': 'Siirrä kohtaan…',
-        'pal_move_position': 'Uusi järjestysnumero (alkaen 1):',
-        'pal_move': 'Siirrä',
-        'pal_move_range': 'Anna numero väliltä 1–{n}.',
-        'pal_summary': '{name} ({n} väriä)',
         'imp_busy': 'Viimeistele ensin avoin tuonti tai tiedostoikkuna.',
         'export_failed': 'Vienti epäonnistui. Aiempi tiedosto säilytettiin. Lisätiedot: error.log.',
+        'export_open_failed': 'Tiedosto tallennettu, mutta selaimen avaaminen epäonnistui. Avaa HTML-tiedosto itse.',
+        'export_aco_limit': 'ACO tukee enintään 65 535 väriä. Valitse toinen vientimuoto.',
         'export_saved': 'Tiedosto tallennettu.',
         'config_blocked': 'Asetuksia ei voitu lukea tai varmuuskopioida turvallisesti. Tallennus on estetty tämän istunnon ajan. Nykyinen config.json säilytetään.',
-        'config_recovered': 'Vioittuneet asetukset varmuuskopioitiin config.json-tiedoston viereen. Käytössä ovat oletusasetukset.',
+        'config_recovered': 'Vioittuneet asetukset varmuuskopioitiin config.json-tiedoston viereen. Luettavat asetukset säilytettiin; virheelliset tiedot ohitettiin tai palautettiin oletuksiin.',
         'config_save_failed': 'Asetusten tallennus epäonnistui. Aiemmat asetukset säilytettiin. Tarkista levytila ja kansion käyttöoikeudet.',
         'pal_color_limit': 'Paletissa on jo enimmäismäärä eli 1000 väriä.',
         # Välilehdet
@@ -190,7 +196,7 @@ _TRANSLATIONS = {
         "tab_simulation": "Simulaatio",
 
         # Napit
-        "pick_color":     "Valitse väri (Alt + P)",
+        "pick_color":     "Valitse väri",
         "export_html":    "Vie HTML",
         "save_palette":   "Tallenna paletti",
         "new_palette":    "Uusi paletti",
@@ -225,15 +231,15 @@ _TRANSLATIONS = {
         "info_appearance":       "Ulkoasu",
         "info_palette_editing":  "Paletin muokkaus",
         "info_palette_help":     (
-            "Klikkaa swatch    Valitse väri\n"
-            "Vedä swatch       Järjestä uudelleen\n"
-            "Oikea nappi       Poista väri\n"
+            "Klikkaa väriä     Valitse väri\n"
+            "Vedä väriä        Järjestä uudelleen\n"
+            "Hiiren oikea     Poista väri\n"
             "+ Lisää väri      Lisää nykyinen väri\n"
             "Kumoa             Kumoa viimeisin muutos\n"
             "Vie               Tallenna paletti tiedostoon"
         ),
         "info_keyboard":         "Pikanäppäimet",
-        "info_keyboard_help":    "Alt + P     Valitse väri (pipetti)",
+        "info_keyboard_help":    "Pikanäppäin toimii kaikissa ohjelmissa ja varaa valitun yhdistelmän. Alt on pakollinen. Esc peruuttaa poiminnan.",
         "info_drop":             "Raahaa & Tuo",
         "info_drop_help":        (
             "Raahaa tiedosto tähän ikkunaan tai käytä\n"
@@ -255,7 +261,7 @@ _TRANSLATIONS = {
         "delete_btn":            "Poista",
         "export_format":         "Valitse muoto:",
         "drop_import_label":     "Tuodaanko tämä paletti?",
-        "img_how_many":          "Kuinka monta väriä?  (2-20)",
+        "img_how_many":          "Kuinka monta väriä?  (2-30)",
         "img_preview":           "Esikatselu:",
         "img_ok":                "OK",
         "pal_limit":            "Palettien enimmäismäärä saavutettu ({n}).",
@@ -290,15 +296,11 @@ _TRANSLATIONS = {
     "dlg_filter_images":    "Kuvatiedostot",
     "dlg_filter_all_files": "Kaikki tiedostot",
     "dlg_html_file":        "HTML-tiedosto",
-    "imp_invalid":          "Ei kelvollinen {fmt}-tiedosto.",
     "imp_none":             "Tiedostosta ({fmt}) ei löytynyt värejä.",
-    "imp_aco_version":      "ACO-versiota {n} ei tueta.",
     "imp_unsupported":      "Tiedostotyyppiä ei tueta: {ext}",
     "imp_no_pillow":        "Tarvitaan Pillow 12.3.0 tai uudempi. Asenna: pip install -r requirements.txt",
-    "imp_img_open":         "Kuvaa ei voitu avata - katso error.log",
     "imp_failed":           "Tuonti epäonnistui - katso error.log",
     "imp_too_large":        "Tiedosto on liian suuri.",
-    "imp_img_too_large":    "Kuva on liian suuri ({w} × {h} px).",
     "imp_capped":           "Vain {n} ensimmäistä väriä tuotiin.",
     "wcag_level_fail":      "Hylätty",
     "html_lang":            "fi",
@@ -416,17 +418,17 @@ _THEORY_EN = {
     "theory_h_8": 'In antiquity, purple dye (Tyrian purple) was made from sea snails. It was extremely expensive, thus becoming the ultimate symbol of royalty and power.',
     "theory_h_9": 'Magenta and fuchsia were among the first synthetically produced aniline dyes in the 19th century, symbolizing the modern era and new technology.',
     "theory_a_36": 'naturalness, calm, earthiness, understatement',
-    "theory_r_36": 'sand and beige tones feel natural and quiet; they stay in the background, suit organic materials and work with almost any accent colour.',
+    "theory_r_36": 'sand and beige tones feel natural and quiet; they stay in the background, suit organic materials and work with almost any accent color.',
     "theory_a_37": 'softness, comfort, quiet elegance',
     "theory_r_37": 'cream, ivory and pale tints are warmer and gentler than pure white: they keep a light, clean feel while adding comfort and a hint of refinement.',
     "theory_a_38": 'understatement, naturalness, sophistication',
-    "theory_r_38": 'warm greys (taupe, stone, greige) soften the coldness of neutral grey and read as natural, calm and quietly refined.',
+    "theory_r_38": 'warm grays (taupe, stone, greige) soften the coldness of neutral gray and read as natural, calm and quietly refined.',
     "theory_a_39": 'precision, calm, seriousness, modernity',
-    "theory_r_39": 'cool and tinted greys (slate, steel) feel precise and composed; they are common in interfaces, tools and corporate design.',
+    "theory_r_39": 'cool and tinted grays (slate, steel) feel precise and composed; they are common in interfaces, tools and corporate design.',
     "theory_a_40": 'maturity, nature, steadiness, earthiness',
     "theory_r_40": 'olive and dark mustard tones are subdued, earthy yellows: they keep the warmth of yellow without its brightness and feel mature, natural and steady.',
-    "theory_h_10": 'Slightly tinted greys are the colours of stone, slate, ash and weathered materials. Painters have long used grey on purpose: grisaille, painting entirely in shades of grey, goes back to the Middle Ages and was used, among other things, to imitate sculpture. In the 20th century greys became central to modernist and minimalist design.',
-    "theory_h_11": "Sand, beige and cream tones come from some of the oldest materials people used: undyed wool and linen, and earth pigments such as ochre. The word 'beige' comes from French, where it first described the natural, undyed colour of wool.",
+    "theory_h_10": 'Slightly tinted grays are the colors of stone, slate, ash and weathered materials. Painters have long used gray on purpose: grisaille, painting entirely in shades of gray, goes back to the Middle Ages and was used, among other things, to imitate sculpture. In the 20th century grays became central to modernist and minimalist design.',
+    "theory_h_11": "Sand, beige and cream tones come from some of the oldest materials people used: undyed wool and linen, and earth pigments such as ochre. The word 'beige' comes from French, where it first described the natural, undyed color of wool.",
     "theory_tt_1": 'cool',
     "theory_tt_2": 'slightly cool',
     "theory_tt_3": 'neutral',
@@ -438,8 +440,8 @@ _THEORY_EN = {
     "theory_td_4": 'leans warm: friendly, with a slight sense of closeness',
     "theory_td_5": 'tends to advance and draw attention',
     "theory_tt_6": 'in between',
-    "theory_temp_title": 'Colour temperature',
-    "theory_td_6": 'sits between warm and cool, so the surrounding colours decide how it feels',
+    "theory_temp_title": 'Color temperature',
+    "theory_td_6": 'sits between warm and cool, so the surrounding colors decide how it feels',
     "theory_ui_1": 'a light page or surface background; keep the text on top dark',
     "theory_ui_2": 'body text or a dark background; strong contrast against light surfaces',
     "theory_ui_3": 'borders, dividers, secondary text and disabled states',
@@ -450,7 +452,7 @@ _THEORY_EN = {
     "theory_ui_8": 'warning, notice or highlight (use dark text on top)',
     "theory_ui_9": 'success, confirmation or a positive status',
     "theory_ui_10": 'a secondary accent, informational highlights or fresh details',
-    "theory_ui_11": 'a primary brand colour, links and informational elements',
+    "theory_ui_11": 'a primary brand color, links and informational elements',
     "theory_ui_12": 'a premium or creative accent and brand highlights',
     "theory_ui_13": 'a playful accent for promotions and highlights',
     "theory_ui_14": 'a soft accent: badges, chips, tags or secondary buttons',

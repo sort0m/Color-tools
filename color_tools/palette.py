@@ -6,11 +6,14 @@ palette.py — Palettien hallinta, muokkaus, undo, drag-and-drop, history-valint
 import time
 
 import dearpygui.dearpygui as dpg
+from . import themes as _themes_mod
 
 from .bootstrap import _sc
 from .color_math import color_sig
 from .i18n import t
-from .state import app, _palettes_lock, _history_lock, save_config
+from .state import app, _palettes_lock, _history_lock, request_palette_save
+from .palette_formats import MAX_COLORS
+from .palette_history import pack_colors, unpack_colors, record_snapshot
 from .harmony import (
     _force_update_color_picker, _update_wheel_contrast, HARMONY_TAGS,
     HIST_TAGS, _apply_external_color_to_pal,
@@ -51,6 +54,7 @@ def can_add_palette():
     if len(app.palettes) >= MAX_PAL_ROWS:
         from .import_export import _navigate_to_palettes
         _navigate_to_palettes()
+        app._import_status_code = None
         app._import_status = (t("pal_limit").format(n=MAX_PAL_ROWS),
                               time.perf_counter() + 5.0)
         return False
@@ -133,7 +137,6 @@ def _rebuild_pal_rows():
             continue
         dpg.delete_item(tag, children_only=True)
         dpg.bind_item_theme(tag, _nospc_theme)
-        dpg.add_text(t('pal_summary').format(name=name, n=count), parent=tag, wrap=_sc(230))
         group = dpg.add_group(parent=tag, horizontal=True)
         dpg.bind_item_theme(group, _nospc_theme)
         for color in colors:
@@ -141,7 +144,7 @@ def _rebuild_pal_rows():
                 width=PAL_SW, height=PAL_SW, no_alpha=True,
                 callback=swatch_cb, user_data=[c / 255. for c in color[:3]] + [1.])
         if not colors:
-            dpg.add_text(t('pal_empty'), parent=group)
+            _themes_mod.add_text(t('pal_empty'), parent=group)
         dpg.add_button(parent=group, label='>>', width=_sc(24), height=PAL_SW,
                        callback=lambda s, a, u: open_palette_editor(u), user_data=name)
         dpg.add_spacer(height=10, parent=tag)
@@ -166,7 +169,7 @@ def _cancel_pal_drag():
 
 def change_editor_page(sender, value, delta):
     if app._pal_edit_dirty:
-        save_config()
+        request_palette_save()
     _cancel_pal_drag()
     # A hidden selected color must not change while browsing another page.
     app._pal_selected_idx = None
@@ -197,41 +200,18 @@ def _move_palette_color(source, destination):
                 app._pal_selected_idx -= 1
             elif destination <= selected < source:
                 app._pal_selected_idx += 1
-        app._pal_pre_edit_snapshot = [list(c) for c in colors]
+        app._pal_pre_edit_snapshot = pack_colors(colors)
     app._pal_edit_dirty = False
     app._pal_dirty = True
-    save_config()
+    request_palette_save()
     return True
-
-
-def _show_move_color():
-    if app._pal_selected_idx is None:
-        return
-    dpg.set_value('pal_move_position', app._pal_selected_idx + 1)
-    dpg.configure_item('pal_move_error', show=False)
-    dpg.configure_item('pal_move_controls', show=True)
-
-
-def _confirm_move_color():
-    position = dpg.get_value('pal_move_position')
-    count = len(app.palettes.get(app._editing_pal, []))
-    source = app._pal_selected_idx
-    if source is None or not 1 <= position <= count:
-        dpg.set_value('pal_move_error', t('pal_move_range').format(n=count))
-        dpg.configure_item('pal_move_error', show=True)
-        return
-    _cancel_pal_drag()
-    _move_palette_color(source, position - 1)
-    app._pal_edit_page = (position - 1) // _EDIT_COLORS_PER_PAGE
-    _refresh_pal_edit_panel()
-    dpg.set_y_scroll('pal_edit_win', 0)
 
 
 def open_palette_editor(name):
     if not name or name not in app.palettes:
         return
     if app._pal_edit_dirty:
-        save_config()
+        request_palette_save()
     _cancel_pal_drag()
     app._pal_edit_page = 0
     app._pal_selected_idx = None
@@ -248,10 +228,10 @@ def _push_pal_undo(name):
     with _palettes_lock:
         if not name or name not in app.palettes:
             return
-        colors_copy = [list(c) for c in app.palettes[name]]
-    app._pal_undo_stack.append((name, colors_copy))
+        colors_copy = pack_colors(app.palettes[name])
+    record_snapshot(app._pal_undo_stack, name, colors_copy)
     if dpg.does_item_exist("pal_undo_btn"):
-        dpg.configure_item("pal_undo_btn", enabled=True)
+        dpg.configure_item("pal_undo_btn", enabled=_pal_undo_available())
 
 def _pal_undo_available():
     """True jos muokattavalle palettille on olemassa undo-merkintä."""
@@ -277,17 +257,19 @@ def _pal_undo(s, a, u):
             break
     if pos is None:
         return
-    name, colors = app._pal_undo_stack[pos]
+    name, snapshot = app._pal_undo_stack[pos]
+    colors = unpack_colors(snapshot)
     del app._pal_undo_stack[pos]
     idx = app._pal_selected_idx
+    # Suppress palette writes only while restoring the selected color, not
+    # for subsequent user actions. Programmatic picker updates are deferred.
     app._pal_selected_idx = None
     app._pal_edit_dirty = False
-    app._pal_undo_freeze = 4
     with _palettes_lock:
         app.palettes[name] = colors
         if name not in app._pal_order:
             app._pal_order.append(name)
-    app._pal_pre_edit_snapshot = [list(c) for c in colors]
+    app._pal_pre_edit_snapshot = pack_colors(colors)
     if (name == app._editing_pal
             and idx is not None
             and idx < len(colors)):
@@ -297,7 +279,7 @@ def _pal_undo(s, a, u):
         _sync_all_modes()
         _update_wheel_contrast()
     app._pal_selected_idx = idx if (idx is not None and idx < len(colors)) else None
-    save_config()
+    request_palette_save()
     _rebuild_pal_rows()
     _refresh_pal_edit_panel()
     if dpg.does_item_exist("pal_undo_btn"):
@@ -322,10 +304,9 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
 
     # ── Callbackit ──────────────────────────────────────────────────────
     def _close_edit(s, a, u):
-        # Tallenna viimeinen muokkaus heti (muuten se jäisi odottamaan
-        # historia-viivettä, jota ei enää ajeta kun editori on suljettu).
+        # Schedule the last edit even when the editor closes before the history delay.
         if app._pal_edit_dirty:
-            save_config()
+            request_palette_save()
         app._editing_pal = None
         app._pal_selected_idx = None
         _cancel_pal_drag()
@@ -335,7 +316,8 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
         nm = app._editing_pal
         if not nm or nm not in app.palettes:
             return
-        if len(app.palettes[nm]) >= 1000:
+        if len(app.palettes[nm]) >= MAX_COLORS:
+            app._import_status_code = None
             app._import_status = (t('pal_color_limit'), time.perf_counter() + 5)
             return
         r, g, b = color_sig(app.current_color)
@@ -347,7 +329,7 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
         app._pal_pre_edit_snapshot = None
         app._pal_edit_dirty = False
         app._pal_dirty = True
-        save_config()
+        request_palette_save()
         _rebuild_pal_rows()
         _refresh_pal_edit_panel()
 
@@ -374,7 +356,7 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
         app._editing_pal = None
         app._pal_selected_idx = None
         app._pal_dirty = True
-        save_config()
+        request_palette_save()
         _rebuild_pal_rows()
         _refresh_pal_edit_panel()
 
@@ -402,20 +384,9 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
         with dpg.group(horizontal=True, show=pages > 1):
             dpg.add_button(label='<', tag='pedit_prev', callback=change_editor_page,
                            user_data=-1, enabled=app._pal_edit_page > 0)
-            dpg.add_text(t('pal_editor_page').format(page=app._pal_edit_page + 1, pages=pages), tag='pedit_page_label')
+            _themes_mod.add_text(t('pal_editor_page').format(page=app._pal_edit_page + 1, pages=pages), tag='pedit_page_label')
             dpg.add_button(label='>', tag='pedit_next', callback=change_editor_page,
                            user_data=1, enabled=app._pal_edit_page < pages - 1)
-        dpg.add_text(t('pal_editor_range').format(first=start + 1 if count else 0, last=end, n=count))
-        dpg.add_button(label=t('pal_move_to'), tag='pal_move_btn',
-                       callback=_show_move_color, enabled=app._pal_selected_idx is not None)
-        with dpg.group(tag='pal_move_controls', show=False):
-            dpg.add_text(t('pal_move_position'))
-            dpg.add_input_int(tag='pal_move_position', default_value=1, step=0, width=_sc(110))
-            with dpg.group(horizontal=True):
-                dpg.add_button(label=t('pal_move'), callback=_confirm_move_color)
-                dpg.add_button(label=t('cancel'), callback=lambda: dpg.configure_item('pal_move_controls', show=False))
-            dpg.add_text('', tag='pal_move_error', show=False, wrap=_sc(220), color=[220, 80, 80])
-        dpg.add_spacer(height=2)
         if preview:
             for row_start in range(0, len(preview), _ECOLS):
                 grp = dpg.add_group(horizontal=True)
@@ -441,7 +412,7 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
                                            fill=[c[0], c[1], c[2], 255],
                                            color=border, thickness=thick)
         else:
-            dpg.add_text(t("pal_empty_edit"), color=[120, 120, 120])
+            _themes_mod.add_text(t("pal_empty_edit"), color=[120, 120, 120])
 
         dpg.add_spacer(height=2)
         dpg.add_separator()
@@ -460,7 +431,7 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
 
         with dpg.group(tag="pal_del_confirm_grp", show=False):
             dpg.add_spacer(height=_sc(6))
-            dpg.add_text(t("delete_confirm"), color=[220, 80, 80])
+            _themes_mod.add_text(t("delete_confirm"), color=[220, 80, 80])
             dpg.add_spacer(height=_sc(6))
             _grp_del = dpg.add_group(horizontal=True)
             dpg.add_button(parent=_grp_del, label=t("delete_btn"), width=_BW2, height=THUMB_H, callback=_del_pal_confirmed)
@@ -468,14 +439,14 @@ def _refresh_pal_edit_panel(drag_src=None, drag_insert=None):
 
         dpg.add_spacer(height=2)
         dpg.add_button(
-            label=t("close"), width=0, height=THUMB_H,
+            label=t("close"), width=_BW2, height=THUMB_H,
             callback=_close_edit, tag="pal_close_btn",
         )
 
     # Vientimuoto-paneeli
     from .import_export import _hide_export_format, _execute_palette_export
     with dpg.group(parent="pal_edit_panel", horizontal=False, tag="pal_export_format_panel", show=False):
-        dpg.add_text(t("export_format"), tag="lbl_export_format", color=[200, 200, 200])
+        _themes_mod.add_text(t("export_format"), tag="lbl_export_format", color=[200, 200, 200])
         dpg.add_spacer(height=_sc(8))
         dpg.add_radio_button(
             items=["HTML (web)", "ASE (Adobe)", "ACO (Adobe)", "GPL (GIMP)",
@@ -542,10 +513,10 @@ def _pal_swatch_right_click(rmb_clicked):
                                 app._pal_edit_dirty = False
                             elif app._pal_selected_idx > idx:
                                 app._pal_selected_idx -= 1
-                        app._pal_pre_edit_snapshot = [list(c) for c in app.palettes[nm]]
+                        app._pal_pre_edit_snapshot = pack_colors(app.palettes[nm])
                         app._pal_edit_dirty = False
                 app._pal_dirty = True
-                save_config()
+                request_palette_save()
                 _rebuild_pal_rows()
                 _refresh_pal_edit_panel()
                 return
@@ -574,7 +545,7 @@ def _pal_swatch_drag(lmb_dn, lmb_clk, lmb_rel):
         index = hovered_slot()
         if index is not None:
             if app._pal_edit_dirty:
-                save_config()
+                request_palette_save()
             app._pal_drag_idx = index
             app._pal_drag_insert = index
             app._pal_drag_active = False
@@ -587,7 +558,7 @@ def _pal_swatch_drag(lmb_dn, lmb_clk, lmb_rel):
                 app._pal_selected_idx = index
                 app._last_edit_color_sig = None
                 with _palettes_lock:
-                    app._pal_pre_edit_snapshot = [list(c) for c in app.palettes[name]]
+                    app._pal_pre_edit_snapshot = pack_colors(app.palettes[name])
                     color = app.palettes[name][index]
                 _force_update_color_picker([v / 255. for v in color[:3]] + [1.])
                 from .sliders import _sync_all_modes
@@ -659,7 +630,7 @@ def save_selected_as_palette():
         name = _auto_pal_name()
         app.palettes[name] = colors
         _register_palette(name)
-    save_config()
+    request_palette_save()
     _rebuild_pal_rows()
     _exit_palette_select_mode()
 
@@ -667,8 +638,6 @@ def toggle_palette_select_mode():
     if app.palette_select_mode:
         if app.selected_history_indices:
             save_selected_as_palette()
-            if dpg.does_item_exist("btn_cancel_palette"):
-                dpg.configure_item("btn_cancel_palette", show=False)
         else:
             _exit_palette_select_mode()
     else:
@@ -725,5 +694,5 @@ def save_harmony_as_palette():
         name = _auto_pal_name()
         app.palettes[name] = colors
         _register_palette(name)
-    save_config()
+    request_palette_save()
     _rebuild_pal_rows()

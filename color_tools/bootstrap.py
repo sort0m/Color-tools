@@ -5,6 +5,7 @@ Täytyy importoida ensimmäisenä ennen muita moduuleja.
 """
 
 import os
+import re
 import sys
 import traceback
 import ctypes
@@ -184,16 +185,20 @@ _u32.SetClipboardData.restype   = ctypes.c_void_p
 _u32.SetClipboardData.argtypes  = [ctypes.c_uint, ctypes.c_void_p]
 
 def _clipboard_set(text):
+    owner = _get_own_hwnd()
+    if not owner:
+        raise OSError("Clipboard owner window unavailable")
     buf  = ctypes.create_unicode_buffer(text)
     size = ctypes.sizeof(buf)                       # sis. päättävän nollan
     for _ in range(20):                             # toinen sovellus voi pitää leikepöytää hetken lukittuna
-        if _u32.OpenClipboard(None):
+        if _u32.OpenClipboard(owner):
             break
         time.sleep(0.01)
     else:
         raise OSError("OpenClipboard failed")
     try:
-        _u32.EmptyClipboard()
+        if not _u32.EmptyClipboard():
+            raise OSError("EmptyClipboard failed")
         h = _k32.GlobalAlloc(_GMEM_MOVEABLE, size)
         if not h:
             raise MemoryError("GlobalAlloc failed")
@@ -222,13 +227,19 @@ try:
 except Exception:
     _fatal("Could not import dearpygui:\n\n" + traceback.format_exc())
 
+def _supported_pillow_version(version):
+    """Accept stable releases; prereleases must not bypass the minimum version."""
+    match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:\.post\d+)?(?:\+[a-zA-Z0-9.]+)?', version)
+    return bool(match and tuple(map(int, match.groups())) >= (12, 3, 0))
+
+
 # PIL on valinnainen — käytetään vain kuvan paletti-tuontiin.
 try:
     import PIL
     import PIL.Image  # noqa: F401
-    _PIL_AVAILABLE = tuple(int(v) for v in PIL.__version__.split('.')[:3]) >= (12, 3, 0)
+    _PIL_AVAILABLE = _supported_pillow_version(PIL.__version__)
     if not _PIL_AVAILABLE:
-        _write_log("Pillow >= 12.3.0 required for safe image import; install requirements.txt.")
+        _write_log("Stable Pillow >= 12.3.0 required for image import; install requirements.txt.")
 except Exception:
     _PIL_AVAILABLE = False
     _write_log("Pillow unavailable — image palette import disabled.\nInstall with: pip install -r requirements.txt")
@@ -261,7 +272,7 @@ def acquire_instance_lock():
         raise ctypes.WinError(error)
     if error == 183:  # ERROR_ALREADY_EXISTS
         kernel.CloseHandle(handle)
-        raise RuntimeError('Color Tools is already running. / Color Tools on jo käynnissä.')
+        return None
     import atexit
     atexit.register(kernel.CloseHandle, handle)
     return handle

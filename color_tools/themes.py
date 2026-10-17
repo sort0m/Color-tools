@@ -8,6 +8,7 @@ dpg.create_context():n jälkeen.
 import dearpygui.dearpygui as dpg
 
 from .bootstrap import _sc
+from .accessibility import contrast_color
 
 # Teema-muuttujat — asetetaan create_themes()-funktion jälkeen
 _nospc_theme          = None
@@ -35,6 +36,103 @@ _titlebar_black_theme     = None
 
 _THEME_MAP  = {}
 THEME_NAMES = []
+TEXT_SURFACES = (
+    'WindowBg', 'ChildBg', 'PopupBg', 'FrameBg', 'FrameBgHovered', 'FrameBgActive',
+    'Button', 'ButtonHovered', 'ButtonActive', 'Header', 'HeaderHovered', 'HeaderActive',
+    'Tab', 'TabHovered', 'TabActive', 'TabUnfocused', 'TabUnfocusedActive',
+    'TitleBg', 'TitleBgActive', 'TitleBgCollapsed', 'MenuBarBg', 'TextSelectedBg',
+    'TableHeaderBg', 'TableRowBg', 'TableRowBgAlt',
+)
+_TEXT_ITEMS = {}
+_ACCESSIBLE_PALETTES = {}
+
+
+def text_color(preferred):
+    from .state import app
+    palette = _ACCESSIBLE_PALETTES.get(app.theme_name, _ACCESSIBLE_PALETTES.get('Dark'))
+    backgrounds = [palette[key] for key in ('WindowBg', 'ChildBg', 'PopupBg')] if palette else [[26, 26, 26]]
+    return contrast_color(preferred, backgrounds)
+
+
+def _prune_text_items():
+    """Discard deleted widgets before registering another dynamic label."""
+    for item in list(_TEXT_ITEMS):
+        if not dpg.does_item_exist(item):
+            del _TEXT_ITEMS[item]
+
+
+def register_text(item, preferred):
+    _prune_text_items()
+    _TEXT_ITEMS[item] = list(preferred)
+    dpg.configure_item(item, color=text_color(preferred))
+    return item
+
+
+def add_text(*args, **kwargs):
+    """Register explicit text colors so newly opened dialogs follow the theme."""
+    preferred = kwargs.get('color')
+    if preferred is not None:
+        _prune_text_items()
+        kwargs['color'] = text_color(preferred)
+    item = dpg.add_text(*args, **kwargs)
+    if preferred is not None:
+        _TEXT_ITEMS[item] = list(preferred)
+    return item
+
+
+def _make_accessible(theme, is_light=False):
+    component = dpg.get_item_children(theme, 1)[0]
+    nodes = {dpg.get_item_configuration(item)['target']: item
+             for item in dpg.get_item_children(component, 1)
+             if dpg.get_item_type(item) == 'mvAppItemType::mvThemeColor'}
+    def original(name, fallback):
+        item = nodes.get(getattr(dpg, 'mvThemeCol_' + name))
+        return dpg.get_value(item) if item else fallback
+    foreground = [20, 20, 20, 255] if is_light else [245, 245, 245, 255]
+    window = original('WindowBg', [26, 26, 26, 255])
+    palette = {'Text': foreground, 'TextDisabled': foreground}
+    for name in TEXT_SURFACES:
+        fallback = original('ButtonHovered', window) if name.endswith(('Active', 'Hovered')) else window
+        if name == 'TextSelectedBg':
+            fallback = original('Header', original('ButtonHovered', window))
+        palette[name] = contrast_color(original(name, fallback), [foreground])
+    # Keep the same hover relationship in every theme. Light text already
+    # gains contrast when darkened; dark text may need a lighter active base.
+    active = palette['TabActive']
+    for step in range(256):
+        base = [round(c + (255 - c) * step / 255) for c in active[:3]]
+        hover = [round(c * 0.88) for c in base] + [255]
+        if contrast_color(hover, [foreground]) == hover:
+            palette['TabActive'] = base + [255]
+            palette['TabUnfocusedActive'] = base + [255]
+            palette['TabHovered'] = hover
+            break
+    for name, color in palette.items():
+        target = getattr(dpg, 'mvThemeCol_' + name)
+        if target in nodes:
+            dpg.set_value(nodes[target], color)
+        else:
+            dpg.add_theme_color(target, color, parent=component)
+    dpg.add_theme_style(dpg.mvStyleVar_DisabledAlpha, 1., parent=component)
+    with dpg.theme_component(dpg.mvAll, parent=theme, enabled_state=False):
+        # Flatten disabled controls into the window, retaining readable text.
+        for name, color in palette.items():
+            if name in ('Button', 'ButtonHovered', 'ButtonActive', 'FrameBg'):
+                color = palette['WindowBg']
+            dpg.add_theme_color(getattr(dpg, 'mvThemeCol_' + name), color)
+        dpg.add_theme_color(dpg.mvThemeCol_Border, contrast_color([110, 110, 110], [foreground]))
+        dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1.)
+        dpg.add_theme_style(dpg.mvStyleVar_DisabledAlpha, 1.)
+    return palette
+
+
+def _accessible_button(theme, colors):
+    component = dpg.get_item_children(theme, 1)[0]
+    # Explicit opaque colors for every interaction state, independent of theme.
+    dpg.delete_item(component, children_only=True)
+    for name, color in zip(('Button', 'ButtonHovered', 'ButtonActive'), colors):
+        dpg.add_theme_color(getattr(dpg, 'mvThemeCol_' + name), contrast_color(color, [[255, 255, 255]]), parent=component)
+    dpg.add_theme_color(dpg.mvThemeCol_Text, [255, 255, 255, 255], parent=component)
 
 def create_themes():
     """Luo kaikki DPG-teemat. Kutsuttava dpg.create_context():n jälkeen."""
@@ -46,6 +144,8 @@ def create_themes():
     global _titlebar_dark_theme, _titlebar_light_theme, _titlebar_midnight_theme
     global _titlebar_mocha_theme, _titlebar_nord_theme, _titlebar_solarized_theme
     global _titlebar_black_theme, _THEME_MAP, THEME_NAMES
+    _TEXT_ITEMS.clear()
+    _ACCESSIBLE_PALETTES.clear()
 
     with dpg.theme() as _nospc_theme:
         with dpg.theme_component(dpg.mvAll):
@@ -94,8 +194,9 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [30,  30,  30,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [20,  20,  20,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [45,  45,  45,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [80,  80,  80,  200])
-            dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [60,  60,  60,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [25,  85, 140,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabUnfocused,   [45,  45,  45,  255])
+            dpg.add_theme_color(dpg.mvThemeCol_TabUnfocusedActive, [25, 85, 140, 255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [55,  55,  55,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding,   4, 3)
@@ -114,7 +215,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,        [220, 220, 220, 255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,          [160, 160, 160, 255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,                [200, 200, 200, 255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,         [66,  150, 250, 200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,          [66,  150, 250, 255])
             dpg.add_theme_color(dpg.mvThemeCol_TabUnfocused,       [200, 200, 200, 255])
             dpg.add_theme_color(dpg.mvThemeCol_TabUnfocusedActive, [66,  150, 250, 255])
@@ -134,7 +234,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [16,  22,  30,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [10,  13,  18,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [22,  30,  40,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [48,  84,  130, 200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [31,  54,  84,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [30,  42,  56,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
@@ -153,7 +252,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [38,  32,  28,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [22,  18,  15,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [50,  42,  36,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [120, 88,  60,  200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [90,  65,  45,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [65,  54,  46,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
@@ -172,7 +270,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [59,  66,  82,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [36,  41,  51,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [59,  66,  82,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [94,  129, 172, 200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [58,  90,  130, 255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [67,  76,  94,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
@@ -191,7 +288,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [7,   54,  66,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [0,   33,  42,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [7,   54,  66,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [42,  161, 152, 200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [0,   95,  89,  255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [0,   72,  88,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
@@ -210,7 +306,6 @@ def create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_PopupBg,        [15,  15,  15,  255])
             dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg,    [0,   0,   0,   255])
             dpg.add_theme_color(dpg.mvThemeCol_Tab,            [45,  45,  45,  255])
-            dpg.add_theme_color(dpg.mvThemeCol_TabHovered,     [110, 110, 110, 200])
             dpg.add_theme_color(dpg.mvThemeCol_TabActive,      [100, 100, 100, 255])
             dpg.add_theme_color(dpg.mvThemeCol_Separator,      [55,  55,  55,  255])
             dpg.add_theme_style(dpg.mvStyleVar_TabRounding,    2)
@@ -244,6 +339,10 @@ def create_themes():
         "Black":     (_black_theme,     _titlebar_black_theme,     False),
     }
     THEME_NAMES = list(_THEME_MAP.keys())
+    for name, (theme, _, is_light) in _THEME_MAP.items():
+        _ACCESSIBLE_PALETTES[name] = _make_accessible(theme, is_light)
+    _accessible_button(_close_btn_theme, ([180, 50, 50], [220, 80, 80], [160, 35, 35]))
+    _accessible_button(_new_palette_select_theme, ([0, 150, 0], [0, 180, 0], [0, 200, 0]))
 
 # ── set_theme ─────────────────────────────────────────────────────────────────
 def set_theme(sender, name, _u=None):
@@ -260,32 +359,11 @@ def set_theme(sender, name, _u=None):
     if dpg.does_item_exist("theme_combo"):
         dpg.set_value("theme_combo", theme_name)
 
-    # Päivitä tekstit teeman mukaan (korjaa vaalean teeman lukemattomuus)
-    text_colors = {
-        "headers": (
-            ["lbl_appearance", "lbl_pal_edit_hdr", "lbl_kb_hdr", "lbl_drop_hdr", "theory_title", "lbl_version", "drop_preview_label", "lbl_sim_preview"],
-            [30, 80, 180, 255] if is_light else [160, 200, 255, 255]
-        ),
-        "muted": (
-            ["lbl_theme", "lbl_lang", "lbl_pal_edit_help", "lbl_kb_help", "lbl_drop_help", "lbl_author", "lbl_drop_import", "theory_text", "lbl_wcag_title", "lbl_wcag_w", "lbl_wcag_b", "lbl_wcag_c", "lbl_export_format", "theory_temp_lbl"],
-            [80, 80, 80, 255] if is_light else [180, 180, 180, 255]
-        ),
-        "error": (
-            ["lbl_wcag_fail", "import_error_text"],
-            [200, 30, 30, 255] if is_light else [200, 70, 70, 255]
-        ),
-        "accent": (
-            ["theory_tags"],
-            [20, 110, 110, 255] if is_light else [130, 210, 200, 255]
-        ),
-        "wcag_aalg": (["lbl_wcag_aalg"], [180, 100, 0, 255] if is_light else [230, 160, 40, 255]),
-        "wcag_aa": (["lbl_wcag_aa"], [40, 140, 40, 255] if is_light else [170, 220, 60, 255]),
-        "wcag_aaa": (["lbl_wcag_aaa"], [20, 120, 20, 255] if is_light else [80, 210, 80, 255]),
-    }
-    for category, (tags, color) in text_colors.items():
-        for tag in tags:
-            if dpg.does_item_exist(tag):
-                dpg.configure_item(tag, color=color)
+    for item, preferred in list(_TEXT_ITEMS.items()):
+        if dpg.does_item_exist(item):
+            dpg.configure_item(item, color=text_color(preferred))
+        else:
+            del _TEXT_ITEMS[item]
 
     # Päivitä logo
     if is_light:
@@ -322,10 +400,11 @@ def _redraw_harmony_combo_icon(mode):
         return
     dpg.delete_item("hm_icon_dl", children_only=True)
     angles, tint_shd = _HARMONY_ICON_DATA.get(mode, ([], None))
-    D  = _sc(44)
-    R  = _sc(14)
-    CX = D // 2
-    CY = D // 2
+    width = dpg.get_item_width("hm_icon_dl")
+    height = dpg.get_item_height("hm_icon_dl")
+    R  = _sc(17)
+    CX = width / 2
+    CY = height / 2
     DR = _sc(4)
     COL_RING = [100, 100, 100, 180]
     COL_MAIN = [255, 200,  50, 255]
@@ -335,9 +414,10 @@ def _redraw_harmony_combo_icon(mode):
     dpg.draw_circle(parent="hm_icon_dl", center=(CX, CY), radius=R,
                     color=COL_RING, thickness=1)
     if tint_shd:
-        step = (D - _sc(6)) // 4
+        dot_radius = _sc(4)
+        step = (width - 2 * (dot_radius + _sc(1))) / 4
         for i in range(5):
-            tx = _sc(3) + i * step
+            tx = CX + (i - 2) * step
             t  = i / 4.0
             if tint_shd == "tint":
                 c = [int(100+155*t), int(60+100*t), int(20+40*t), 255]
@@ -345,7 +425,7 @@ def _redraw_harmony_combo_icon(mode):
                 c = [int(200-180*t), int(80-70*t), int(20-15*t), 255]
             else:
                 c = [int(120+40*t), int(80+40*t), int(20+20*t), 255]
-            dpg.draw_circle(parent="hm_icon_dl", center=(tx, CY), radius=_sc(3),
+            dpg.draw_circle(parent="hm_icon_dl", center=(tx, CY), radius=dot_radius,
                             color=[0,0,0,0], fill=c)
     else:
         bx = int(CX + R * math.cos(BASE_A))

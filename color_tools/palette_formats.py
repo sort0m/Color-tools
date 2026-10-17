@@ -10,6 +10,7 @@ import time as _time
 from .color_math import lab_to_rgb
 
 MAX_COLORS = 1000
+MAX_ACO_COLORS = 65535
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_ZIP_JSON_BYTES = 5 * 1024 * 1024
 
@@ -90,12 +91,14 @@ def parse_ase(data, limit=MAX_COLORS):
 
 
 def parse_aco(data, limit=MAX_COLORS):
+    """Return supported colors, limit flag and unsupported-color count."""
     if len(data) < 4:
         raise ValueError('invalid ACO header')
     version, count = struct.unpack_from('>HH', data)
     if version not in (1, 2):
         raise ValueError('unsupported ACO version')
     pos, colors = 4, []
+    skipped = supported = 0
     for _ in range(count):
         if pos + 10 > len(data):
             raise ValueError('truncated ACO color')
@@ -109,11 +112,13 @@ def parse_aco(data, limit=MAX_COLORS):
             if chars < 1 or pos + chars * 2 > len(data):
                 raise ValueError('invalid ACO name length')
             pos += chars * 2
-        if rgb is not None:
-            colors.append([*rgb, 255])
-        if len(colors) > limit:
-            break
-    return colors[:limit], len(colors) > limit
+        if rgb is None:
+            skipped += 1
+        else:
+            supported += 1
+            if len(colors) < limit:
+                colors.append([*rgb, 255])
+    return colors, supported > limit, skipped
 
 
 def parse_gpl(stream, limit=MAX_COLORS):
@@ -260,6 +265,8 @@ def _build_ase(color_list):
 
 def _build_aco(color_list):
     n = len(color_list)
+    if n > MAX_ACO_COLORS:
+        raise ValueError(f'ACO supports at most {MAX_ACO_COLORS} colors')
     def _encode_color(c):
         r16 = (c[0] << 8) | c[0]; g16 = (c[1] << 8) | c[1]; b16 = (c[2] << 8) | c[2]
         return struct.pack('>HHHHH', 0, r16, g16, b16, 0)

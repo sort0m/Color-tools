@@ -13,9 +13,11 @@ import os
 import shutil
 import threading
 import traceback
+import time
 import uuid
 from collections import deque
 
+from .hotkey_config import DEFAULT_HOTKEY, clean_hotkey
 from .storage import atomic_write
 
 from .bootstrap import (
@@ -36,7 +38,9 @@ class AppState:
         self.pipette_active       = False
         self.pip_color            = [0, 0, 0, 255]
         self._pipette_thread_tid  = 0
-        self._pipette_hotkey_held = False
+        self.pipette_hotkey = dict(DEFAULT_HOTKEY)
+        self._hotkey_notice = ""
+        self._drop_preview_warning = (False, 0)
         self.current_color   = [0.2, 0.5, 1.0, 1.0]
         self.contrast_bg     = [255, 255, 255, 255]
         self.history         = deque(maxlen=60)
@@ -68,6 +72,8 @@ class AppState:
         self.selected_history_indices     = set()
         self.selected_history_colors      = {}
         self._import_status       = ("", 0.0)
+        self._import_status_code = None
+        self._palette_save_due = 0.0
         self._pal_drag_idx        = None
         self._pal_drag_active     = False
         self._pal_drag_start      = (0, 0)
@@ -85,7 +91,6 @@ class AppState:
         self._pal_edit_page = 0
         self._pal_pre_edit_snapshot = None
         self._pal_edit_dirty      = False
-        self._pal_undo_freeze     = 0
         self._last_picker_force_time = 0.0
         self._pending_wheel_sync     = None
         self._pending_picker_color   = None
@@ -133,8 +138,7 @@ app = AppState()
 
 # ── Konfiguraatio ────────────────────────────────────────────────────────────
 def _backup_broken_config():
-    """Kopioi lukukelvottoman config.json:n talteen, ennen kuin save_config
-    ehtii ylikirjoittaa sen oletusarvoilla."""
+    """Preserve damaged settings before defaults or recovered data are saved."""
     try:
         if not os.path.exists(CFG_FILE):
             return None
@@ -143,7 +147,7 @@ def _backup_broken_config():
             # Älä ylikirjoita aiempaa varmuuskopiota
             bak = f"{CFG_FILE}.{uuid.uuid4().hex}.bak"
         shutil.copy2(CFG_FILE, bak)
-        _write_log(f"config.json could not be read. Backup saved to: {bak}")
+        _write_log(f"config.json requires recovery. Backup saved to: {bak}")
         return bak
     except Exception:
         _write_log("Backing up broken config failed:\n" + traceback.format_exc())
@@ -162,6 +166,10 @@ def load_config():
         cfg = json.loads(data)
         if not isinstance(cfg, dict):
             raise ValueError("config root is not a JSON object")
+        if _config_discards_data(cfg):
+            # Preserve original data before apply_config filters or normalizes it.
+            _config_write_blocked = not bool(_backup_broken_config())
+            app._config_error = 'config_blocked' if _config_write_blocked else 'config_recovered'
         return cfg
     except FileNotFoundError:
         return {}
@@ -172,9 +180,16 @@ def load_config():
         app._config_error = 'config_blocked' if _config_write_blocked else 'config_recovered'
         return {}
 
+def request_palette_save():
+    """Coalesce palette edits; the main loop flushes within half a second."""
+    if not app._palette_save_due:
+        app._palette_save_due = time.perf_counter() + 0.5
+
+
 def save_config():
     """Serialize snapshots and atomic writes, including callback callers."""
     with _save_lock:
+        app._palette_save_due = 0.0
         return _save_config_locked()
 
 
@@ -190,6 +205,7 @@ def _save_config_locked():
             palettes_snapshot  = {k: [list(c) for c in v] for k, v in app.palettes.items()}
             pal_order_snapshot = list(app._pal_order)
         data = json.dumps({
+                'pipette_hotkey': dict(app.pipette_hotkey),
                 'history':   history_snapshot,
                 'palettes':  palettes_snapshot,
                 'pal_order': pal_order_snapshot,
@@ -235,6 +251,29 @@ def _clean_colors(seq):
             out.append(cc)
     return out
 
+def _config_discards_data(cfg):
+    """Detect lossy history/palette recovery before the original is replaced."""
+    def altered(colors):
+        if not isinstance(colors, list):
+            return True
+        for color in colors:
+            clean = _clean_color(color)
+            if (clean is None or list(color[:3]) != clean[:3]
+                    or len(color) > 4 or len(color) == 4 and color[3] != 255):
+                return True
+        return False
+
+    if 'history' in cfg:
+        history = cfg['history']
+        if altered(history) or len(history) > 60:
+            return True
+    if 'palettes' in cfg:
+        palettes = cfg['palettes']
+        if not isinstance(palettes, dict) or any(altered(v) for v in palettes.values()):
+            return True
+    return False
+
+
 def apply_config(cfg):
     """Soveltaa ladatun konfiguraation app-olioon.
 
@@ -243,6 +282,7 @@ def apply_config(cfg):
     if not isinstance(cfg, dict):
         cfg = {}
 
+    app.pipette_hotkey = clean_hotkey(cfg.get('pipette_hotkey'))
     hist = cfg.get('history')
     if isinstance(hist, list):
         app.history = deque(_clean_colors(hist)[:60], maxlen=60)

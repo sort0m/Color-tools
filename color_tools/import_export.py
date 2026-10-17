@@ -24,7 +24,7 @@ else:
     _PIL_Image = None
 
 from .color_math import (
-    rgb_to_cmyk, contrast_ratio, nearest_css,
+    rgb_to_cmyk, contrast_ratio, nearest_css, format_color,
 )
 from .i18n import t
 from .state import app, _palettes_lock, _history_lock
@@ -32,7 +32,7 @@ from .storage import atomic_write
 from .palette_formats import (
     parse_ase, parse_aco, parse_gpl, parse_swatches, parse_afpalette,
     _build_ase, _build_aco, _build_gpl, _build_swatches, _build_afpalette,
-    MAX_COLORS as _MAX_IMPORT_COLORS, MAX_FILE_BYTES as _MAX_FILE_BYTES,
+    MAX_COLORS as _MAX_IMPORT_COLORS, MAX_FILE_BYTES as _MAX_FILE_BYTES, MAX_ACO_COLORS,
 )
 
 # Tuetut kuvaformaatit
@@ -72,10 +72,12 @@ def _quantize_image(pil_img, n):
 _IMG_PREVIEW_COLS = 10
 
 def _commit_image_palette(colors):
-    """Tallentaa tuodut värit historiaan ja palettiin. Säieturvallinen."""
-    from .palette import _auto_pal_name, _register_palette, can_add_palette
+    """Commit imported colors and reset history selection on the UI thread."""
+    from .palette import _auto_pal_name, _register_palette, can_add_palette, _exit_palette_select_mode
     if not can_add_palette():
         return
+    if app.palette_select_mode:
+        _exit_palette_select_mode()
     with _history_lock:
         hist_set = {tuple(x) for x in app.history}
         for c in reversed(colors):
@@ -116,7 +118,7 @@ def _image_import_slider_cb(s, v):
     if not app._image_modal_open or app._image_modal_pil is None:
         return
     try:
-        app._image_modal_colors = _quantize_image(app._image_modal_pil, max(2, min(20, int(v))))
+        app._image_modal_colors = _quantize_image(app._image_modal_pil, max(2, min(30, int(v))))
     except Exception:
         app._image_modal_colors = []
         _write_log('Image quantization failed:\n' + traceback.format_exc())
@@ -171,8 +173,9 @@ def _open_image_import_panel(pil_img):
         dpg.set_value("img_import_slider", 8)
     _rebuild_image_import_preview()
 
-def _set_status(msg, secs=5.0):
+def _set_status(msg, secs=5.0, *, code=None):
     app._import_status = (msg, _time.perf_counter() + secs)
+    app._import_status_code = code
 
 _IMAGE_FORMATS = ('PNG', 'JPEG', 'BMP', 'GIF', 'WEBP', 'TIFF')
 _import_active = threading.BoundedSemaphore(1)
@@ -224,15 +227,19 @@ def _import_from_path(path):
                     data = stream.read(_MAX_FILE_BYTES + 1)
                 if len(data) > _MAX_FILE_BYTES:
                     raise ValueError('palette exceeds size limit')
-                if ext == '.gpl':
+                skipped = 0
+                if ext == '.aco':
+                    colors, capped, skipped = parse_aco(data)
+                elif ext == '.gpl':
                     colors, capped = parse_gpl(io.StringIO(data.decode('utf-8-sig', errors='replace')))
                 elif ext == '.swatches':
                     colors, capped = parse_swatches(io.BytesIO(data))
                 else:
-                    parser = {'.ase': parse_ase, '.aco': parse_aco, '.afpalette': parse_afpalette}[ext]
+                    parser = {'.ase': parse_ase, '.afpalette': parse_afpalette}[ext]
                     colors, capped = parser(data)
-                result = (('palette', colors, os.path.basename(path), capped) if colors
-                          else ('error', t('imp_none').format(fmt=ext)))
+                result = (('palette', colors, os.path.basename(path), capped, skipped) if colors
+                          else ('error', t('imp_aco_none').format(n=skipped) if skipped
+                                else t('imp_none').format(fmt=ext)))
             else:
                 result = ('error', t('imp_unsupported').format(ext=ext))
         except Exception:
@@ -257,11 +264,11 @@ def process_import_results():
             _navigate_to_palettes()
             _open_image_import_panel(result[1])
         elif result[0] == 'palette':
-            _, colors, name, capped = result
+            _, colors, name, capped, skipped = result
             app._drop_preview_colors_pending = colors
-            _open_drop_preview(colors, name)
-            if capped:
-                _set_status(t('imp_capped').format(n=_MAX_IMPORT_COLORS))
+            _open_drop_preview(colors, name, capped=capped, skipped=skipped)
+            if skipped or capped:
+                _set_status(_import_warning(capped, skipped), secs=12.0)
         else:
             _set_status(result[1])
     finally:
@@ -278,7 +285,7 @@ def _start_dialog(work):
             work()
         except Exception:
             _write_log('File dialog failed:\n' + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
         finally:
             _dialog_active.release()
     try:
@@ -328,7 +335,25 @@ def _navigate_to_palettes():
     if dpg.does_item_exist("bottom_tab_bar") and dpg.does_item_exist("tab_palettes"):
         dpg.set_value("bottom_tab_bar", "tab_palettes")
 
-def _open_drop_preview(colors, fname):
+def _import_warning(capped, skipped):
+    messages = []
+    if skipped:
+        messages.append(t('imp_aco_skipped').format(n=skipped))
+    if capped:
+        messages.append(t('imp_capped').format(n=_MAX_IMPORT_COLORS))
+    return '\n'.join(messages)
+
+
+def refresh_import_warning():
+    if dpg.does_item_exist('drop_preview_warning'):
+        text = _import_warning(*app._drop_preview_warning)
+        dpg.set_value('drop_preview_warning', text)
+        dpg.configure_item('drop_preview_warning', show=bool(text))
+
+
+def _open_drop_preview(colors, fname, *, capped=False, skipped=0):
+    app._drop_preview_warning = (capped, skipped)
+    refresh_import_warning()
     app._drop_preview_open = True
     if app._image_modal_open:       # sulje avoin kuvatuontipaneeli, ettei lippu jää päälle
         _image_import_close()
@@ -412,8 +437,8 @@ _HCSS = (
     "<script>"
     "function cc(t,b){"
     "navigator.clipboard.writeText(t).then(()=>{"
-    "var o=b.innerText;b.innerText='HTMLCOPIED_PLACEHOLDER';b.style.background='#4CAF50';"
-    "setTimeout(()=>{b.innerText=o;b.style.background=''},1200)})}"
+    "var o=b.innerText;b.innerText='HTMLCOPIED_PLACEHOLDER';b.classList.add('copied');"
+    "setTimeout(()=>{b.innerText=o;b.classList.remove('copied')},1200)})}"
     "function tg(b){"
     "var td=b.parentNode.parentNode;"
     "var s=td.querySelector('.th-s');"
@@ -422,27 +447,32 @@ _HCSS = (
     "else{f.style.display='none';s.style.display='block';}}"
     "</script>"
     "<style>"
-    "body{font-family:'Segoe UI',sans-serif;background:#111;color:#ddd;padding:30px;margin:0}"
+    "HTMLFONTS_PLACEHOLDER"
+    "HTMLTHEME_PLACEHOLDER"
+    "body{font-family:var(--ui-font);font-size:var(--ui-size);background:var(--page);color:var(--text);padding:30px;margin:0}"
+    "button{font-family:var(--ui-font);font-size:inherit}"
     "h2{margin-bottom:18px;font-weight:600;letter-spacing:.03em}"
-    "table{border-collapse:collapse;background:#1a1a1a;white-space:nowrap}"
-    "td,th{border:1px solid #2a2a2a;padding:7px 10px;font-size:13px;vertical-align:middle}"
-    "th{background:#222;color:#aaa;font-weight:600;text-transform:uppercase;"
-    "font-size:11px;letter-spacing:.06em;white-space:nowrap}"
-    "tr:hover td{background:#222}"
-    ".sw{width:52px;height:30px;border-radius:5px;border:1px solid #333;display:block}"
-    ".cb{cursor:pointer;padding:3px 10px;background:#2e2e2e;color:#bbb;"
-    "border:1px solid #444;border-radius:4px;font-size:11px;display:block;width:100%;"
+    "table{border-collapse:collapse;background:var(--surface);white-space:nowrap}"
+    "td,th{border:1px solid var(--border);padding:7px 10px;font-size:inherit;vertical-align:middle}"
+    "th{background:var(--header);color:var(--text);font-weight:600;text-transform:uppercase;"
+    "font-size:var(--ui-size);letter-spacing:.06em;white-space:nowrap}"
+    "tr:hover td{background:var(--hover)}"
+    ".sw{width:52px;height:30px;border-radius:5px;border:1px solid var(--border);display:block}"
+    ".cb{cursor:pointer;padding:3px 10px;background:var(--button);color:var(--text);"
+    "border:1px solid var(--border);border-radius:4px;font-size:var(--ui-size);display:block;width:100%;"
     "box-sizing:border-box;margin-top:2px}"
     ".cb:first-child{margin-top:0}"
-    ".cb:hover{background:#3d3d3d;color:#fff;border-color:#666}"
-    ".mono{font-family:'Consolas','Courier New',monospace;font-size:12px}"
-    ".wcag-aaa{color:#4caf50;font-weight:700}"
-    ".wcag-aa{color:#8bc34a;font-weight:700}"
-    ".wcag-aa-lg{color:#cddc39}"
-    ".wcag-fail{color:#e05555}"
+    ".cb:hover{background:var(--button-hover)}"
+    ".cb.copied{background:var(--button-active)}"
+    "a{color:var(--link)}"
+    ".color-value{font-family:var(--ui-font);font-size:var(--ui-size);font-weight:400;font-variant-numeric:tabular-nums}"
+    ".wcag-aaa{color:var(--aaa);font-weight:700}"
+    ".wcag-aa{color:var(--aa);font-weight:700}"
+    ".wcag-aa-lg{color:var(--aa-large)}"
+    ".wcag-fail{color:var(--fail)}"
     ".ctr-row{display:flex;align-items:center;gap:6px;margin-bottom:3px}"
     ".ctr-bar{display:inline-block;padding:1px 8px;border-radius:3px;"
-    "font-size:13px;font-weight:600;white-space:nowrap}"
+    "font-size:var(--ui-size);font-weight:600;white-space:nowrap}"
     ".ctr-bar-w{background:#ffffff;border:1px solid #555}"
     ".ctr-bar-b{background:#000000;border:1px solid #555}"
     "</style>"
@@ -461,6 +491,7 @@ def _html_color_row(r, g, b):
     c_, m_, y_, k_ = rgb_to_cmyk(r, g, b)
     cmyk = f"C{c_:.0f}% M{m_:.0f}% Y{y_:.0f}% K{k_:.0f}%"
     css = nearest_css(r, g, b)
+    oklch = format_color((r, g, b), "OKLCH")
     cw = contrast_ratio(r, g, b, 255, 255, 255)
     cb = contrast_ratio(r, g, b, 0,   0,   0  )
     def _wcag_cls(ratio):
@@ -477,19 +508,20 @@ def _html_color_row(r, g, b):
 
     theory_cell = (
         f"<div class=\"th-s\" style=\"display:block;\">{short_text} "
-        f"<a href=\"javascript:void(0)\" onclick=\"tg(this)\" style=\"color:#44aaff;text-decoration:none;font-weight:bold;\">&gt;&gt;</a></div>"
+        f"<a href=\"javascript:void(0)\" onclick=\"tg(this)\" style=\"text-decoration:none;font-weight:bold;\">&gt;&gt;</a></div>"
         f"<div class=\"th-f\" style=\"display:none;\">{theory_html} <br>"
-        f"<a href=\"javascript:void(0)\" onclick=\"tg(this)\" style=\"color:#44aaff;text-decoration:none;font-weight:bold;\">&lt;&lt;</a></div>"
+        f"<a href=\"javascript:void(0)\" onclick=\"tg(this)\" style=\"text-decoration:none;font-weight:bold;\">&lt;&lt;</a></div>"
     )
 
     return (
         f"<tr>"
         f"<td><span class=\"sw\" style=\"background:{hx}\"></span></td>"
-        f"<td class=\"mono\">{hx} {_html_copy_btn(hx)}</td>"
-        f"<td class=\"mono\">{rgb}</td>"
-        f"<td class=\"mono\">{hsl}</td>"
-        f"<td class=\"mono\">{hsv}</td>"
-        f"<td class=\"mono\">{cmyk}</td>"
+        f"<td class=\"color-value\">{hx} {_html_copy_btn(hx)}</td>"
+        f"<td class=\"color-value\">{rgb}</td>"
+        f"<td class=\"color-value\">{hsl}</td>"
+        f"<td class=\"color-value\">{hsv}</td>"
+        f"<td class=\"color-value\">{cmyk}</td>"
+        f"<td class=\"color-value\">{oklch}</td>"
         f"<td>{css}</td>"
         f"<td>"
         f"<div class=\"ctr-row\"><span class=\"{cw_cls}\">W &nbsp;{cw:.2f}:1 &nbsp;{cw_lbl}</span>"
@@ -497,23 +529,61 @@ def _html_color_row(r, g, b):
         f"<div class=\"ctr-row\"><span class=\"{cb_cls}\">B &nbsp;{cb:.2f}:1 &nbsp;{cb_lbl}</span>"
         f"<span class=\"ctr-bar ctr-bar-b\" style=\"color:{hx}\">Text</span></div>"
         f"</td>"
-        f"<td style=\"font-size:12px; max-width:250px; white-space:normal; line-height:1.4;\">{theory_cell}</td>"
+        f"<td style=\"max-width:250px; white-space:normal; line-height:1.4;\">{theory_cell}</td>"
         f"</tr>"
     )
 
 def _html_table_header():
     return (
         f"<tr><th>{t('html_th_preview')}</th><th>HEX</th><th>RGB</th>"
-        f"<th>HSL</th><th>HSV</th><th>CMYK</th>"
+        f"<th>HSL</th><th>HSV</th><th>CMYK</th><th>OKLCH</th>"
         f"<th>{t('html_th_cssname')}</th><th>{t('html_th_contrast')}</th>"
         f"<th>{t('html_th_theory')}</th></tr>"
     )
 
+def _html_theme_css():
+    """Snapshot the selected application's actual, contrast-adjusted colors."""
+    from .themes import _ACCESSIBLE_PALETTES
+    from .accessibility import contrast_color
+    fallback = {
+        'Text': [245, 245, 245], 'WindowBg': [26, 26, 26],
+        'ChildBg': [26, 26, 26], 'TableHeaderBg': [34, 34, 34],
+        'HeaderHovered': [34, 34, 34], 'Button': [46, 46, 46],
+        'ButtonHovered': [61, 61, 61], 'ButtonActive': [61, 61, 61],
+        'FrameBg': [46, 46, 46],
+    }
+    palette = _ACCESSIBLE_PALETTES.get(app.theme_name, _ACCESSIBLE_PALETTES.get('Dark', fallback))
+    colors = {name: palette[key] for name, key in {
+        'text': 'Text', 'page': 'WindowBg', 'surface': 'ChildBg',
+        'header': 'TableHeaderBg', 'hover': 'HeaderHovered',
+        'button': 'Button', 'button-hover': 'ButtonHovered',
+        'button-active': 'ButtonActive', 'border': 'FrameBg',
+    }.items()}
+    backgrounds = [colors['surface'], colors['hover']]
+    for name, preferred in {
+        'link': [128, 199, 255], 'aaa': [165, 224, 165],
+        'aa': [139, 195, 74], 'aa-large': [205, 220, 57],
+        'fail': [255, 170, 170],
+    }.items():
+        colors[name] = contrast_color(preferred, backgrounds)
+    return ':root{' + ''.join(
+        f'--{name}:#{int(round(rgb[0])):02x}{int(round(rgb[1])):02x}{int(round(rgb[2])):02x};'
+        for name, rgb in colors.items()
+    ) + '}'
+
+
 def _html_begin():
     """HTML-dokumentin alku (otsikkopaikat täytetään tallennettaessa)."""
-    css = _HCSS.replace('HTMLCOPIED_PLACEHOLDER', t("html_copied"))
+    from . import fonts
+    font_css = (
+        f":root{{--ui-font:'{fonts.UI_FONT_FAMILY}',Tahoma,Arial,sans-serif;"
+        f"--ui-size:{fonts.HTML_UI_FONT_SIZE}px;}}"
+    )
+    css = (_HCSS.replace('HTMLCOPIED_PLACEHOLDER', t("html_copied"))
+           .replace('HTMLFONTS_PLACEHOLDER', font_css)
+           .replace('HTMLTHEME_PLACEHOLDER', _html_theme_css()))
     return (
-        f"<html lang='{t('html_lang')}'><head><meta charset='utf-8'>HTMLTITLE_PLACEHOLDER{css}</head><body>"
+        f"<!doctype html><html lang='{t('html_lang')}'><head><meta charset='utf-8'>HTMLTITLE_PLACEHOLDER{css}</head><body>"
         f"<h2>HTMLH2_PLACEHOLDER</h2>"
         f"<table>{_html_table_header()}"
     )
@@ -536,10 +606,14 @@ def _save_html_dialog(content, default_name):
                 ).replace('HTMLH2_PLACEHOLDER', safe_title)
                 saved = _write_export(path, final)
                 if saved and path.lower().endswith(('.html', '.htm')):   # älä aja muuta kuin HTML:ää
-                    os.startfile(path)
+                    try:
+                        os.startfile(path)
+                    except OSError as e:
+                        _write_log(f"HTML launch error: {e}")
+                        _set_status(t("export_open_failed"), code="export_open_failed")
         except Exception as e:
             _write_log(f"Save error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
 
 def export_palette():
@@ -579,11 +653,14 @@ def _save_ase_dialog(colors, default_name):
                 _write_export(path, _build_ase(colors))
         except Exception as e:
             _write_log(f"ASE export error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
 
 # ── ACO-vienti ────────────────────────────────────────────────────────────────
 def _save_aco_dialog(colors, default_name):
+    if len(colors) > MAX_ACO_COLORS:
+        _set_status(t("export_aco_limit"), code="export_aco_limit")
+        return
     def _run():
         try:
             path = _win32_save_file(t("dlg_export_title").format(fmt="ACO"),
@@ -593,7 +670,7 @@ def _save_aco_dialog(colors, default_name):
                 _write_export(path, _build_aco(colors))
         except Exception as e:
             _write_log(f"ACO export error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
 
 # ── GPL-vienti ────────────────────────────────────────────────────────────────
@@ -608,7 +685,7 @@ def _save_gpl_dialog(colors, default_name):
                 _write_export(path, _build_gpl(pal_name, colors))
         except Exception as e:
             _write_log(f"GPL export error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
 
 # ── Procreate .swatches -vienti ───────────────────────────────────────────────
@@ -627,7 +704,7 @@ def _save_swatches_dialog(colors, default_name):
                 _write_export(path, buf.getvalue())
         except Exception as e:
             _write_log(f"Swatches export error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
 
 # ── Affinity .afpalette -vienti ───────────────────────────────────────────────
@@ -647,5 +724,5 @@ def _save_afpalette_dialog(colors, default_name):
                 _write_export(path, data)
         except Exception as e:
             _write_log(f"Affinity palette export error: {e}\n" + traceback.format_exc())
-            _set_status(t('export_failed'))
+            _set_status(t('export_failed'), code='export_failed')
     _start_dialog(_run)
