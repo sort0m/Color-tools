@@ -268,10 +268,29 @@ def start_pipette():
 _pip_u32 = ctypes.windll.user32
 _pip_g32 = ctypes.windll.gdi32
 _PIP_OW       = max(130, int(130 * _DPI_SCALE))
-_PIP_OH       = max(28,  int(28  * _DPI_SCALE))
+_PIP_BAR_H    = max(28,  int(28  * _DPI_SCALE))
+_PIP_CELL     = max(10, int(10 * _DPI_SCALE))
+_PIP_LENS_D   = 9 * _PIP_CELL
+_PIP_LENS_X   = (_PIP_OW - _PIP_LENS_D) // 2
+_PIP_LENS_Y   = 0
+_PIP_BAR_Y    = _PIP_LENS_D + _sc(6)
+_PIP_OH       = _PIP_BAR_Y + _PIP_BAR_H
 _PIP_SW       = max(28,  int(28  * _DPI_SCALE))
 _pip_hwnd = [None]
 _pip_cls  = [None]
+_pip_previous_cursor = [None]
+
+
+def _pip_hide_cursor():
+    previous = _pip_u32.SetCursor(None)
+    if previous and _pip_previous_cursor[0] is None:
+        _pip_previous_cursor[0] = previous
+
+
+def _pip_restore_cursor():
+    if _pip_previous_cursor[0] is not None:
+        _pip_u32.SetCursor(_pip_previous_cursor[0])
+        _pip_previous_cursor[0] = None
 
 _PIP_BG_A   = 185
 _PIP_BG_VAL = (
@@ -281,13 +300,16 @@ _PIP_BG_VAL = (
     | (_PIP_BG_A << 24)
 )
 _pip_pixel_template = (ctypes.c_uint32 * (_PIP_OW * _PIP_OH))()
-for _i in range(_PIP_OW * _PIP_OH):
+for _i in range(_PIP_OW * _PIP_BAR_Y, _PIP_OW * _PIP_OH):
     _pip_pixel_template[_i] = _PIP_BG_VAL
-for _ty in range(_PIP_OH):
+for _ty in range(_PIP_BAR_Y, _PIP_OH):
     for _tx in range(_PIP_SW, _PIP_OW):
         _pip_pixel_template[_ty * _PIP_OW + _tx] = 0xFF000000
 
 def _pip_wndproc(hwnd, msg, wp, lp):
+    if msg == 0x0020 and app.pipette_active:  # WM_SETCURSOR
+        _pip_hide_cursor()
+        return 1
     if msg == 0x0002:  # WM_DESTROY
         return 0
     return _pip_u32.DefWindowProcW(hwnd, msg, wp, lp)
@@ -342,6 +364,10 @@ def init_pip_overlay():
             0, 0, _PIP_OW, _PIP_OH,
             None, None, _pip_hInst, None,
         )
+        # Exclude the moving overlay from subsequent screen samples.
+        _pip_u32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        _pip_u32.SetWindowDisplayAffinity.restype = ctypes.c_bool
+        _pip_u32.SetWindowDisplayAffinity(_pip_hwnd[0], 0x11)
     return _pip_hInst
 
 # ── GDI-resurssit ─────────────────────────────────────────────────────────────
@@ -397,6 +423,14 @@ _pip_g32.CreateFontW.restype = ctypes.c_void_p
 _pip_font_path = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'consola.ttf')
 _pip_g32.DeleteDC.restype               = ctypes.c_bool
 _pip_g32.DeleteDC.argtypes              = [ctypes.c_void_p]
+_pip_g32.StretchBlt.restype = ctypes.c_bool
+_pip_g32.StretchBlt.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_ulong,
+]
+_pip_g32.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_pip_g32.SetStretchBltMode.restype = ctypes.c_int
 _pip_g32.SetBkMode.restype              = ctypes.c_int
 _pip_g32.SetBkMode.argtypes             = [ctypes.c_void_p, ctypes.c_int]
 _pip_g32.SetBkColor.restype             = ctypes.c_ulong
@@ -444,6 +478,7 @@ def _pip_init_gdi():
         _pip_u32.ReleaseDC(None, hdc_screen)
 
 def _pip_free_gdi():
+    _pip_restore_cursor()
     if _pip_gdi.get('font'):
         _pip_g32.SelectObject(_pip_gdi['hdc_mem'], _pip_gdi['old_font'])
         _pip_g32.DeleteObject(_pip_gdi['font'])
@@ -475,6 +510,46 @@ _pip_text_pixels = tuple(
     for coverage in range(256)
 )
 
+def _pip_draw_lens(hdc_screen, hdc_mem, bits_ptr, x, y):
+    """Nearest-neighbour screen pixels, circular mask and a two-tone target."""
+    # Clip desktop edges without shifting the pixel under the crosshair.
+    left = _pip_u32.GetSystemMetrics(76)
+    top = _pip_u32.GetSystemMetrics(77)
+    right = left + _pip_u32.GetSystemMetrics(78)
+    bottom = top + _pip_u32.GetSystemMetrics(79)
+    sx, sy = max(left, x - 4), max(top, y - 4)
+    sw, sh = min(right, x + 5) - sx, min(bottom, y + 5) - sy
+    _pip_g32.SetStretchBltMode(hdc_mem, 3)  # COLORONCOLOR: sharp pixel blocks
+    if sw > 0 and sh > 0:
+        _pip_g32.StretchBlt(
+            hdc_mem, _PIP_LENS_X + (sx - x + 4) * _PIP_CELL,
+            _PIP_LENS_Y + (sy - y + 4) * _PIP_CELL,
+            sw * _PIP_CELL, sh * _PIP_CELL,
+            hdc_screen, sx, sy, sw, sh, 0x00CC0020)
+    _pip_g32.GdiFlush()
+    pixels = (ctypes.c_uint32 * (_PIP_OW * _PIP_OH)).from_address(bits_ptr.value)
+    radius = _PIP_LENS_D / 2
+    lo, hi = 4 * _PIP_CELL, 5 * _PIP_CELL - 1
+    for ly in range(_PIP_LENS_D):
+        for lx in range(_PIP_LENS_D):
+            index = (ly + _PIP_LENS_Y) * _PIP_OW + lx + _PIP_LENS_X
+            distance = (lx + .5 - radius) ** 2 + (ly + .5 - radius) ** 2
+            if distance > radius ** 2:
+                pixels[index] = 0
+            elif distance >= (radius - 1) ** 2:
+                pixels[index] = 0xFFAAAAAA
+            elif lo - 1 <= lx <= hi + 1 and lo - 1 <= ly <= hi + 1 and (
+                    lx in (lo - 1, hi + 1) or ly in (lo - 1, hi + 1)):
+                pixels[index] = 0xFF000000
+            elif lo <= lx <= hi and lo <= ly <= hi and (
+                    lx in (lo, hi) or ly in (lo, hi)):
+                pixels[index] = 0xFFFFFFFF
+            elif lx % _PIP_CELL == 0 or ly % _PIP_CELL == 0:
+                pixels[index] = 0xFF808080
+            else:
+                pixels[index] |= 0xFF000000
+
+
 def _pip_draw(ox, oy, pr, pg, pb):
     """Piirtää eyedropper-overlayn UpdateLayeredWindow:lla."""
     if not _pip_hwnd[0]:
@@ -493,26 +568,28 @@ def _pip_draw(ox, oy, pr, pg, pb):
         _pip_sw_row[_k] = sw_val
     _row_stride = _PIP_OW * 4
     _sw_x_off   = 4 * 4
-    for sy in range(4, _PIP_OH - 4):
-        dst = bits_ptr.value + sy * _row_stride + _sw_x_off
+    for sy in range(4, _PIP_BAR_H - 4):
+        dst = bits_ptr.value + (_PIP_BAR_Y + sy) * _row_stride + _sw_x_off
         ctypes.memmove(dst, _pip_sw_row, _pip_sw_row_bytes)
 
     hex_str = f"#{pr:02X}{pg:02X}{pb:02X}"
     _pip_g32.SetBkMode(hdc_mem, 2)
     _pip_g32.SetBkColor(hdc_mem, 0x000000)
     _pip_g32.SetTextColor(hdc_mem, 0xFFFFFF)
-    rc3 = _wt.RECT(_PIP_SW, 0, _PIP_OW - 2, _PIP_OH)
+    rc3 = _wt.RECT(_PIP_SW, _PIP_BAR_Y, _PIP_OW - 2, _PIP_OH)
     _pip_u32.DrawTextW(hdc_mem, hex_str, -1, ctypes.byref(rc3), 0x0025)
     # Finish batched GDI writes before reading/modifying DIB memory directly.
     _pip_g32.GdiFlush()
 
     _txt_x_off = _PIP_SW * 4
-    for _ty in range(_PIP_OH):
-        src = bits_ptr.value + _ty * _row_stride + _txt_x_off
+    for _ty in range(_PIP_BAR_H):
+        src = bits_ptr.value + (_PIP_BAR_Y + _ty) * _row_stride + _txt_x_off
         ctypes.memmove(_pip_txt_row, src, _pip_txt_row_bytes)
         for _k in range(_PIP_TEXT_W):
             _pip_txt_row[_k] = _pip_text_pixels[_pip_txt_row[_k] & 0xFF]
         ctypes.memmove(src, _pip_txt_row, _pip_txt_row_bytes)
+
+    _pip_draw_lens(hdc_screen, hdc_mem, bits_ptr, _pip_pt.x, _pip_pt.y)
 
     pt_dst = _wt.POINT(ox, oy)
     pt_src = _wt.POINT(0, 0)
@@ -539,6 +616,8 @@ _pip_u32.ShowWindow.restype  = ctypes.c_bool
 _pip_u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _pip_u32.GetCursorPos.restype  = ctypes.c_bool
 _pip_u32.GetCursorPos.argtypes = [ctypes.c_void_p]
+_pip_u32.SetCursor.restype = ctypes.c_void_p
+_pip_u32.SetCursor.argtypes = [ctypes.c_void_p]
 _pip_u32.GetSystemMetrics.restype  = ctypes.c_int
 _pip_u32.GetSystemMetrics.argtypes = [ctypes.c_int]
 _pip_u32.PeekMessageW.restype  = ctypes.c_bool
@@ -565,14 +644,10 @@ def _pip_overlay_update():
         _pip_u32.DispatchMessageW(ctypes.byref(_msg2))
     if app.pipette_active:
         _pip_u32.GetCursorPos(ctypes.byref(_pip_pt))
-        _vx0 = _pip_u32.GetSystemMetrics(76)
-        _vy0 = _pip_u32.GetSystemMetrics(77)
-        _vsw = _pip_u32.GetSystemMetrics(78)
-        _vsh = _pip_u32.GetSystemMetrics(79)
-        ox = _pip_pt.x + _sc(18)
-        oy = _pip_pt.y + _sc(18)
-        if ox + _PIP_OW > _vx0 + _vsw: ox = _pip_pt.x - _PIP_OW - _sc(4)
-        if oy + _PIP_OH > _vy0 + _vsh: oy = _pip_pt.y - _PIP_OH - _sc(4)
+        # Keep the target on the exact sampled pixel, even at screen edges.
+        # The lens may be clipped there; moving it would misrepresent the target.
+        ox = _pip_pt.x - _PIP_LENS_X - _PIP_LENS_D // 2
+        oy = _pip_pt.y - _PIP_LENS_Y - _PIP_LENS_D // 2
         with _pip_lock:
             _pr, _pg, _pb = app.pip_color[0], app.pip_color[1], app.pip_color[2]
         _pip_draw(ox, oy, _pr, _pg, _pb)
@@ -580,10 +655,12 @@ def _pip_overlay_update():
             _pip_u32.SetWindowPos(_pip_hwnd[0], _PIP_HWND_TOPMOST, 0, 0, 0, 0, _PIP_SWP_FLAGS)
             _pip_was_visible[0] = True
         _pip_u32.ShowWindow(_pip_hwnd[0], 4)
+        _pip_hide_cursor()
     else:
         if _pip_was_visible[0]:
             _pip_was_visible[0] = False
         _pip_u32.ShowWindow(_pip_hwnd[0], 0)
+        _pip_restore_cursor()
 
 
 # ── Configurable global shortcut ────────────────────────────────────────────

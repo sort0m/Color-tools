@@ -1,4 +1,4 @@
-# Color Tools
+# Color Tools V1.4.1
 
 A compact color picker and palette manager for **Windows**. Pick colors from the screen, explore color harmonies, check contrast, extract palettes from images and convert palette files between applications.
 
@@ -6,7 +6,7 @@ The interface starts in **English**. Finnish is available in the **Info** tab.
 
 ## Download and run
 
-The standalone Windows x64 executable is intended for this repository's **Releases** section. Once a release is published, download **ColorTools.exe**, close any older running version and double-click the file. No separate Python installation is needed.
+Download the standalone Windows x64 executable **ColorTools.exe** from the **V1.4.1** release in this repository's **Releases** section. Close any older running version and double-click the file. No separate Python installation is needed.
 
 Color Tools uses the official Dear PyGui package. The GitHub version does not require a modified Python installation or a custom Dear PyGui build.
 
@@ -85,7 +85,7 @@ Alternatively, launch with `python -m color_tools` from the activated environmen
 & .\.venv\Scripts\python.exe -B -m PyInstaller --noconfirm ColorTools.spec
 ```
 
-The result is **`dist/ColorTools.exe`**, a standalone executable with UPX disabled. Upload it as a GitHub Release asset. Keep generated binaries, build directories and local Python environments out of the source repository.
+The result is **`dist/ColorTools.exe`**, a standalone executable with UPX disabled. Build it from this V1.4.1 source folder and upload it as an asset of the **V1.4.1** GitHub Release, using **V1.4.1** as the release tag. The application's Info tab displays **Color Tools v1.4.1**. Keep generated binaries, build directories and local Python environments out of the source repository.
 
 ## Tests
 
