@@ -11,6 +11,49 @@ from color_tools import eyedropper as eye
 
 
 class MagnifierTests(unittest.TestCase):
+    def test_physical_pixel_context_restores_after_error(self):
+        previous = 0x123456789
+        with patch.object(eye, '_pip_set_thread_dpi', return_value=previous) as setter:
+            with self.assertRaisesRegex(RuntimeError, 'drawing failed'):
+                with eye._pip_physical_pixels():
+                    raise RuntimeError('drawing failed')
+        self.assertEqual(setter.call_args_list[0].args, (-3,))
+        self.assertEqual(setter.call_args_list[-1].args, (previous,))
+
+    def test_physical_pixel_context_without_thread_dpi_api(self):
+        with patch.object(eye, '_pip_set_thread_dpi', None):
+            with eye._pip_physical_pixels():
+                pass
+
+    @unittest.skipUnless(hasattr(ctypes.windll.user32, 'GetWindowDpiAwarenessContext'),
+                         'Per-window DPI awareness requires Windows 10')
+    def test_overlay_is_per_monitor_aware_and_restores_calling_context(self):
+        native = ctypes.WinDLL('user32')
+        native.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        native.GetWindowDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        native.GetWindowDpiAwarenessContext.restype = ctypes.c_void_p
+        native.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        native.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
+        native.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        native.AreDpiAwarenessContextsEqual.restype = ctypes.c_bool
+        previous = native.GetThreadDpiAwarenessContext()
+        instance = None
+        with patch.object(eye, '_pip_hwnd', [None]), patch.object(
+                eye, '_pip_cls', [None]), patch.object(
+                eye.app, '_pip_wndproc_cb', None, create=True):
+            try:
+                instance = eye.init_pip_overlay()
+                self.assertTrue(eye._pip_hwnd[0])
+                context = native.GetWindowDpiAwarenessContext(eye._pip_hwnd[0])
+                self.assertEqual(native.GetAwarenessFromDpiAwarenessContext(context), 2)
+                self.assertTrue(native.AreDpiAwarenessContextsEqual(
+                    native.GetThreadDpiAwarenessContext(), previous))
+            finally:
+                if eye._pip_hwnd[0]:
+                    eye._pip_u32.DestroyWindow(eye._pip_hwnd[0])
+                if instance and eye._pip_cls[0]:
+                    eye._pip_u32.UnregisterClassW(eye._pip_cls[0], instance)
+
     def test_cursor_restored_after_repeated_hide(self):
         with patch.object(eye, '_pip_previous_cursor', [None]), patch.object(
                 eye._pip_u32, 'SetCursor', side_effect=[123, None, None]) as cursor:
@@ -21,20 +64,38 @@ class MagnifierTests(unittest.TestCase):
             self.assertIsNone(eye._pip_previous_cursor[0])
 
     def test_overlay_target_stays_on_pointer_at_screen_edges(self):
+        position = [0, 0]
+        contexts = []
+        native = ctypes.WinDLL('user32')
+        native.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        native.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        native.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
+        def physical_cursor(pointer):
+            point = ctypes.cast(pointer, ctypes.POINTER(eye._wt.POINT)).contents
+            point.x, point.y = position
+            return True
+        def record_context(*args):
+            contexts.append(native.GetAwarenessFromDpiAwarenessContext(
+                native.GetThreadDpiAwarenessContext()))
         with patch.object(eye, '_pip_hwnd', [123]), patch.object(
                 eye.app, 'pipette_active', True), patch.object(
                 eye._pip_u32, 'PeekMessageW', return_value=0), patch.object(
-                eye._pip_u32, 'GetCursorPos'), patch.object(
+                eye._pip_u32, 'GetCursorPos', side_effect=AssertionError('Logical cursor used')), patch.object(
+                eye._pip_u32, 'GetPhysicalCursorPos', side_effect=physical_cursor), patch.object(
                 eye._pip_u32, 'ShowWindow'), patch.object(
                 eye._pip_u32, 'SetWindowPos'), patch.object(
                 eye, '_pip_hide_cursor'), patch.object(
-                eye, '_pip_was_visible', [False]), patch.object(eye, '_pip_draw') as draw:
-            for x, y in ((0, 0), (-1920, 0), (1919, 1079)):
-                with patch.object(eye, '_pip_pt', eye._wt.POINT(x, y)):
+                eye, '_pip_was_visible', [False]), patch.object(
+                eye, '_pip_draw', side_effect=record_context) as draw:
+            for x, y in ((0, 0), (-1920, 0), (1919, 1079), (1400, 1800), (3200, -700)):
+                position[:] = x, y
+                # A stale/logical point must be replaced by the physical point.
+                with patch.object(eye, '_pip_pt', eye._wt.POINT(1, 2)):
                     eye._pip_overlay_update()
                 ox, oy = draw.call_args.args[:2]
                 self.assertEqual(ox + eye._PIP_LENS_X + eye._PIP_LENS_D // 2, x)
                 self.assertEqual(oy + eye._PIP_LENS_Y + eye._PIP_LENS_D // 2, y)
+            self.assertEqual(contexts, [2] * 5)
 
     def test_pixels_target_transparency_and_desktop_edge(self):
         eye._pip_init_gdi()

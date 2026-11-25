@@ -5,6 +5,7 @@ eyedropper.py — Pipetti (eyedropper), Win32-overlay-ikkuna, GDI-piirto.
 import ctypes
 import os
 import ctypes.wintypes as _wt
+from contextlib import contextmanager
 import threading
 import time as _time
 
@@ -12,6 +13,25 @@ import time as _time
 from .bootstrap import _sc, _DPI_SCALE, _write_log
 from .state import app, _pip_lock
 from .fonts import HEX_FONT_SIZE
+
+# The main window is system-DPI-aware, but the picker must use physical desktop
+# pixels on every monitor. Scope the override to the picker so DearPyGui keeps
+# its original DPI context. Newly created threads need their own override.
+_pip_set_thread_dpi = getattr(ctypes.windll.user32, 'SetThreadDpiAwarenessContext', None)
+if _pip_set_thread_dpi is not None:
+    _pip_set_thread_dpi.argtypes = [ctypes.c_void_p]
+    _pip_set_thread_dpi.restype = ctypes.c_void_p
+
+
+@contextmanager
+def _pip_physical_pixels():
+    previous = _pip_set_thread_dpi(-3) if _pip_set_thread_dpi is not None else None
+    try:
+        yield
+    finally:
+        if previous:
+            _pip_set_thread_dpi(previous)
+
 
 # ── Message-pumping sleep ─────────────────────────────────────────────────────
 _mwfmo_user32 = ctypes.windll.user32
@@ -52,6 +72,7 @@ def _pumping_sleep(seconds):
             break
 
 # ── Pipetti-säie ──────────────────────────────────────────────────────────────
+@_pip_physical_pixels()
 def _pipette_run():
     app.pipette_active = True
 
@@ -91,7 +112,7 @@ def _pipette_run():
     )
 
     _pt0 = _wt.POINT()
-    _user32.GetCursorPos(ctypes.byref(_pt0))
+    _user32.GetPhysicalCursorPos(ctypes.byref(_pt0))
     _pip_pos   = [_pt0.x, _pt0.y]          # aloita kursorin kohdasta, ei (0, 0):sta
     _pip_event = threading.Event()
     _selected_pos = [None]
@@ -104,6 +125,7 @@ def _pipette_run():
         _pip_event.set()
         _post_quit()
 
+    @_pip_physical_pixels()
     def _capture_loop():
         _gdi32  = ctypes.windll.gdi32
         _u32cap = ctypes.windll.user32
@@ -323,6 +345,7 @@ _pip_u32.DefWindowProcW.argtypes = [
     ctypes.c_void_p, ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t,
 ]
 
+@_pip_physical_pixels()
 def init_pip_overlay():
     """Luo overlay-ikkunan. Kutsuttava dpg.create_context():n jälkeen."""
     import os as _os
@@ -614,8 +637,8 @@ _pip_u32.UpdateLayeredWindow.argtypes = [
 ]
 _pip_u32.ShowWindow.restype  = ctypes.c_bool
 _pip_u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_pip_u32.GetCursorPos.restype  = ctypes.c_bool
-_pip_u32.GetCursorPos.argtypes = [ctypes.c_void_p]
+_pip_u32.GetPhysicalCursorPos.restype  = ctypes.c_bool
+_pip_u32.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(_wt.POINT)]
 _pip_u32.SetCursor.restype = ctypes.c_void_p
 _pip_u32.SetCursor.argtypes = [ctypes.c_void_p]
 _pip_u32.GetSystemMetrics.restype  = ctypes.c_int
@@ -634,6 +657,7 @@ _PIP_HWND_TOPMOST = ctypes.c_void_p(-1)
 _PIP_SWP_FLAGS    = ctypes.c_uint(0x0001 | 0x0002 | 0x0010)
 _pip_pt = _wt.POINT()
 
+@_pip_physical_pixels()
 def _pip_overlay_update():
     """Päivittää overlay-ikkunan sijainnin ja piirron. Kutsutaan update()-silmukassa."""
     if not _pip_hwnd[0]:
@@ -643,7 +667,8 @@ def _pip_overlay_update():
         _pip_u32.TranslateMessage(ctypes.byref(_msg2))
         _pip_u32.DispatchMessageW(ctypes.byref(_msg2))
     if app.pipette_active:
-        _pip_u32.GetCursorPos(ctypes.byref(_pip_pt))
+        if not _pip_u32.GetPhysicalCursorPos(ctypes.byref(_pip_pt)):
+            return
         # Keep the target on the exact sampled pixel, even at screen edges.
         # The lens may be clipped there; moving it would misrepresent the target.
         ox = _pip_pt.x - _PIP_LENS_X - _PIP_LENS_D // 2

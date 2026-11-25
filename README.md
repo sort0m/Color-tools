@@ -89,22 +89,17 @@ The result is **`dist/ColorTools.exe`**, a standalone executable with UPX disabl
 
 ## Tests
 
-Run regression tests on Windows:
+Run the included magnifier tests on Windows after installing the dependencies:
 
 ```powershell
 & .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
 
-Tests use isolated settings in `.test-runtime`, leaving your normal settings unchanged. The latest verification passed **90 regression tests**.
+`tests/test_magnifier.py` contains six tests covering pixel magnification, target alignment at desktop edges, cursor restoration and per-monitor DPI handling.
 
-Optional render checks open a test window and check tab widths and value-field alignment:
+Tests use isolated settings in `.test-runtime`, leaving your normal settings unchanged. The rendering test saves a magnifier preview to `.test-runtime/magnifier.png`.
 
-```powershell
-& .\.venv\Scripts\python.exe -B tests/verify_tabs.py 1.0
-& .\.venv\Scripts\python.exe -B tests/verify_value_fonts.py 1.0
-```
-
-Use `1.5` instead of `1.0` to check the larger layout scale. Automated checks do not replace manual testing of screen picking, global shortcuts, file dialogs or moving the window between monitors with different DPI settings.
+Before a release, also manually test screen picking, global shortcuts, file dialogs and moving the window between monitors with different DPI settings.
 
 ## License
 
